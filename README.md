@@ -25,6 +25,8 @@
 
 (*Co-first authors, equal technical contribution; †Co-advisors, equal leading contribution.)
 
+<a href="https://usc.edu/" style="color:#990000;"><sup></sup>University of Southern California</a>
+
 ![Teaser image](assets/teaser.png)
 
 Abstract: *3D Gaussian Splatting (3DGS) has advanced radiance field reconstruction by enabling real-time rendering. However, its reliance on Gaussian kernels for geometry and low-order Spherical Harmonics (SH) for color encoding limits its ability to capture complex geometries and diverse colors.
