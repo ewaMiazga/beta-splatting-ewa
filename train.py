@@ -31,7 +31,7 @@ import json
 def training(args):
     first_iter = 0
     prepare_output_and_logger(args)
-    beta_model = BetaModel(args.sh_degree, args.sb_number)
+    beta_model = BetaModel(args.sh_degree, args.sb_number, args.use_beta)
     scene = Scene(args, beta_model)
     beta_model.training_setup(args)
     if args.start_checkpoint:

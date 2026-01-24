@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from pyexpat import features
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, apply_depth_colormap
@@ -27,6 +28,8 @@ from gsplat.rendering import rasterization
 import json
 import time
 from .beta_viewer import BetaRenderTabState
+
+from utils.spherical_utils import nasg
 
 
 def knn(x, K=4):
@@ -65,7 +68,8 @@ class BetaModel:
         self.sb_params_activation = sb_params_activation
         self.beta_activation = beta_activation
 
-    def __init__(self, sh_degree: int = 0, sb_number: int = 2):
+    def __init__(self, sh_degree: int = 0, sb_number: int = 2, use_beta: bool = True):
+        self.use_beta = use_beta
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         self.sb_number = sb_number
@@ -73,6 +77,8 @@ class BetaModel:
         self._sh0 = torch.empty(0)
         self._shN = torch.empty(0)
         self._sb_params = torch.empty(0)
+        self.features_dc = torch.empty(0)
+        self.features_rest = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -83,34 +89,68 @@ class BetaModel:
         self.setup_functions()
 
     def capture(self):
-        return (
-            self.active_sh_degree,
-            self._xyz,
-            self._sh0,
-            self._shN,
-            self._sb_params,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self._beta,
-            self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-        )
+        if self.use_beta:
+            return (
+                self.active_sh_degree,
+                self._xyz,
+                self._sh0,
+                self._shN,
+                self._sb_params,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._beta,
+                self.optimizer.state_dict(),
+                self.spatial_lr_scale,
+            )
+        else:
+            return (
+                self.active_sh_degree,
+                self._xyz,
+                self._sh0,
+                self._shN,
+                self._sb_params,
+                self.features_dc,
+                self.features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._beta,
+                self.optimizer.state_dict(),
+                self.spatial_lr_scale,
+            )
 
     def restore(self, model_args, training_args):
-        (
-            self.active_sh_degree,
-            self._xyz,
-            self._sh0,
-            self._shN,
-            self._sb_params,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self._beta,
-            opt_dict,
-            self.spatial_lr_scale,
-        ) = model_args
+        if self.use_beta:
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._sh0,
+                self._shN,
+                self._sb_params,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._beta,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args
+        else: 
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._sh0,
+                self._shN,
+                self._sb_params,
+                self.features_dc,
+                self.features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._beta,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args
         self.training_setup(training_args)
         self.optimizer.load_state_dict(opt_dict)
 
@@ -135,6 +175,9 @@ class BetaModel:
     @property
     def get_sb_params(self):
         return self.sb_params_activation(self._sb_params)
+    
+    ## get features 
+    ## get pos, shape, weights
 
     @property
     def get_opacity(self):
@@ -156,14 +199,46 @@ class BetaModel:
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        shs = (
-            torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
-            .float()
-            .cuda()
-        )
-        shs[:, :3, 0] = fused_color
-        shs[:, 3:, 1:] = 0.0
+
+        if self.use_beta:
+            fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+            shs = (
+                torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
+                .float()
+                .cuda()
+            )
+            shs[:, :3, 0] = fused_color
+            shs[:, 3:, 1:] = 0.0
+        
+        else:
+            print("Initializing features for non-beta mode")
+            ### Initialization for features 
+            # TODO:
+            # fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
+            # features = (torch.rand((fused_color.shape[0], 1, (self.max_sh_degree) * self.params_size + 3)).float().cuda() * 2.0 - 1.0) * 2.0
+            
+            # pos_start = 0
+            # pos_end = self.position_size * self.max_sh_degree     
+            # features[:, :, pos_start:pos_end] = 0.0 # + 0.1 * torch.randn_like(features[:, :, pos_start:pos_end]) # positions
+            
+            # weights_start = -3 + (-1) * self.max_sh_degree * self.color_size #* self.max_sh_degree - self.color_size
+            # weights_end   = -3
+            # features[:, :, weights_start:weights_end] = 0.5 #0.5 + 0.05 * torch.randn_like(features[:, :, weights_start:weights_end]) # weights
+            
+            # shape_start = self.position_size * self.max_sh_degree
+            # shape_end   = -3 + (-1) * self.max_sh_degree * self.color_size #-3 * self.max_sh_degree - self.color_size
+            # if self.max_sh_degree  == 0:
+            #     shape_end = 0
+            
+            # # Initialize ALL shape parameters for all degrees
+            # # Calculate shape params per degree: total - position - color
+            # shape_params_per_deg = self.params_size - self.position_size - self.color_size
+            # for deg in range(self.max_sh_degree):
+            #     for param_idx in range(shape_params_per_deg):
+            #         idx = shape_start + deg * shape_params_per_deg + param_idx
+            #         features[:,:, idx] = math.log(0.5)  # Initialize all shape params to log(0.5)
+            # 
+            # features[:, 0, -3:] = fused_color #torch.log(fused_color + 1.0)
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -180,23 +255,30 @@ class BetaModel:
                 (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
             )
         )
+
+        ## Betas initialization
         betas = torch.zeros_like(opacities)
 
-        # [r, g, b, theta, phi, beta]
-        sb_params = torch.zeros(
-            (fused_point_cloud.shape[0], self.sb_number, 6), device="cuda"
+        if self.use_beta:
+            # [r, g, b, theta, phi, beta]
+            sb_params = torch.zeros(
+                (fused_point_cloud.shape[0], self.sb_number, 6), device="cuda"
         )
 
-        # Initialize theta and phi uniformly across the sphere for each primitive and view-dependent parameter
-        theta = torch.pi * torch.rand(
-            fused_point_cloud.shape[0], self.sb_number
-        )  # Uniform in [0, pi]
-        phi = (
-            2 * torch.pi * torch.rand(fused_point_cloud.shape[0], self.sb_number)
-        )  # Uniform in [0, 2pi]
+            # Initialize theta and phi uniformly across the sphere for each primitive and view-dependent parameter
+            theta = torch.pi * torch.rand(
+                fused_point_cloud.shape[0], self.sb_number
+            )  # Uniform in [0, pi]
+            phi = (
+                2 * torch.pi * torch.rand(fused_point_cloud.shape[0], self.sb_number)
+            )  # Uniform in [0, 2pi]
 
-        sb_params[:, :, 3] = theta
-        sb_params[:, :, 4] = phi
+            sb_params[:, :, 3] = theta
+            sb_params[:, :, 4] = phi
+
+        else:
+            ## store feattures
+            features = None
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._sh0 = nn.Parameter(
@@ -205,7 +287,13 @@ class BetaModel:
         self._shN = nn.Parameter(
             shs[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
         )
-        self._sb_params = nn.Parameter(sb_params.requires_grad_(True))
+
+        if self.use_beta:
+            self._sb_params = nn.Parameter(sb_params.requires_grad_(True))
+        else:
+            self._features_dc = nn.Parameter(features[:, :, :3].requires_grad_(True))
+            self._features_rest = nn.Parameter(features[:, :, 3:].requires_grad_(True))
+
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
@@ -215,43 +303,86 @@ class BetaModel:
         self._xyz = self._xyz[live_mask]
         self._sh0 = self._sh0[live_mask]
         self._shN = self._shN[live_mask]
-        self._sb_params = self._sb_params[live_mask]
+        if self.use_beta:
+            self._sb_params = self._sb_params[live_mask]
+        else:
+            self._features_dc = self._features_dc[live_mask]
+            self._features_rest = self._features_rest[live_mask]
         self._scaling = self._scaling[live_mask]
         self._rotation = self._rotation[live_mask]
         self._opacity = self._opacity[live_mask]
         self._beta = self._beta[live_mask]
 
     def training_setup(self, training_args):
-        l = [
-            {
-                "params": [self._xyz],
-                "lr": training_args.position_lr_init * self.spatial_lr_scale,
-                "name": "xyz",
-            },
-            {"params": [self._sh0], "lr": training_args.sh_lr, "name": "sh0"},
-            {"params": [self._shN], "lr": training_args.sh_lr / 20.0, "name": "shN"},
-            {
-                "params": [self._sb_params],
-                "lr": training_args.sb_params_lr,
-                "name": "sb_params",
-            },
-            {
-                "params": [self._opacity],
-                "lr": training_args.opacity_lr,
-                "name": "opacity",
-            },
-            {"params": [self._beta], "lr": training_args.beta_lr, "name": "beta"},
-            {
-                "params": [self._scaling],
-                "lr": training_args.scaling_lr,
-                "name": "scaling",
-            },
-            {
-                "params": [self._rotation],
-                "lr": training_args.rotation_lr,
-                "name": "rotation",
-            },
-        ]
+        if self.use_beta:
+            l = [
+                {
+                    "params": [self._xyz],
+                    "lr": training_args.position_lr_init * self.spatial_lr_scale,
+                    "name": "xyz",
+                },
+                {"params": [self._sh0], "lr": training_args.sh_lr, "name": "sh0"},
+                {"params": [self._shN], "lr": training_args.sh_lr / 20.0, "name": "shN"},
+                {
+                    "params": [self._sb_params],
+                    "lr": training_args.sb_params_lr,
+                    "name": "sb_params",
+                },
+                {
+                    "params": [self._opacity],
+                    "lr": training_args.opacity_lr,
+                    "name": "opacity",
+                },
+                {"params": [self._beta], "lr": training_args.beta_lr, "name": "beta"},
+                {
+                    "params": [self._scaling],
+                    "lr": training_args.scaling_lr,
+                    "name": "scaling",
+                },
+                {
+                    "params": [self._rotation],
+                    "lr": training_args.rotation_lr,
+                    "name": "rotation",
+                },
+            ]
+        else:
+            l = [
+                {
+                    "params": [self._xyz],
+                    "lr": training_args.position_lr_init * self.spatial_lr_scale,
+                    "name": "xyz",
+                },
+                ### is it even ??? -> understand if they are using SH, and for what if they do use SB
+                ## TODO:
+                {"params": [self._sh0], "lr": training_args.sh_lr, "name": "sh0"},
+                {"params": [self._shN], "lr": training_args.sh_lr / 20.0, "name": "shN"},
+                {
+                    "params": [self._features_dc],
+                    "lr": training_args.features_lr,
+                    "name": "features_dc",
+                },
+                {
+                    "params": [self._features_rest],
+                    "lr": training_args.features_lr,
+                    "name": "features_rest",
+                },
+                {
+                    "params": [self._opacity],
+                    "lr": training_args.opacity_lr,
+                    "name": "opacity",
+                },
+                {"params": [self._beta], "lr": training_args.beta_lr, "name": "beta"},
+                {
+                    "params": [self._scaling],
+                    "lr": training_args.scaling_lr,
+                    "name": "scaling",
+                },
+                {
+                    "params": [self._rotation],
+                    "lr": training_args.rotation_lr,
+                    "name": "rotation",
+                },
+            ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
@@ -276,8 +407,16 @@ class BetaModel:
             l.append("sh0_{}".format(i))
         for i in range(self._shN.shape[1] * self._shN.shape[2]):
             l.append("shN_{}".format(i))
-        for i in range(self._sb_params.shape[1] * self._sb_params.shape[2]):
-            l.append("sb_params_{}".format(i))
+
+        if self.use_beta:
+            for i in range(self._sb_params.shape[1] * self._sb_params.shape[2]):
+                l.append("sb_params_{}".format(i))
+        else:
+            ### TODO: Is it correct? 
+            for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
+                l.append("features_dc_{}".format(i))
+            for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
+                l.append("features_rest_{}".format(i))
         l.append("opacity")
         l.append("beta")
         for i in range(self._scaling.shape[1]):
@@ -307,14 +446,33 @@ class BetaModel:
             .cpu()
             .numpy()
         )
-        sb_params = (
-            self._sb_params.transpose(1, 2)
-            .detach()
-            .flatten(start_dim=1)
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
+        if self.use_beta:
+            sb_params = (
+                self._sb_params.transpose(1, 2)
+                .detach()
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+        else:
+            sb_params_dc = (
+                self._features_dc.transpose(1, 2)
+                .detach()
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            sb_params_rest = (
+                self._features_rest.transpose(1, 2)
+                .detach()
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            sb_params = np.concatenate((sb_params_dc, sb_params_rest), axis=1)
         opacities = self._opacity.detach().cpu().numpy()
         betas = self._beta.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -333,6 +491,7 @@ class BetaModel:
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
+    ### Not changed - idk for what is this method 
     def save_png(self, path):
         path = os.path.join(path, "png")
         mkdir_p(path)
@@ -412,17 +571,47 @@ class BetaModel:
             (shs_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
         )
 
-        extra_f_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("sb_params_")
-        ]
-        extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-        assert len(extra_f_names) == self.sb_number * 6
-        sb_params = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            sb_params[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        sb_params = sb_params.reshape((sb_params.shape[0], 6, self.sb_number))
+        if self.use_beta:
+            extra_f_names = [
+                p.name
+                for p in plydata.elements[0].properties
+                if p.name.startswith("sb_params_")
+            ]
+            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
+            assert len(extra_f_names) == self.sb_number * 6
+            sb_params = np.zeros((xyz.shape[0], len(extra_f_names)))
+            for idx, attr_name in enumerate(extra_f_names):
+                sb_params[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            sb_params = sb_params.reshape((sb_params.shape[0], 6, self.sb_number))
+
+        else:
+            extra_f_names = [
+                p.name
+                for p in plydata.elements[0].properties
+                if p.name.startswith("features_dc_")
+            ]
+            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
+            num_dc_features = len(extra_f_names)
+            features_dc = np.zeros((xyz.shape[0], num_dc_features))
+            for idx, attr_name in enumerate(extra_f_names):
+                features_dc[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            features_dc = features_dc.reshape(
+                (features_dc.shape[0], 1, num_dc_features)
+            )
+
+            extra_f_names = [
+                p.name
+                for p in plydata.elements[0].properties
+                if p.name.startswith("features_rest_")
+            ]
+            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
+            num_rest_features = len(extra_f_names)
+            features_rest = np.zeros((xyz.shape[0], num_rest_features))
+            for idx, attr_name in enumerate(extra_f_names):
+                features_rest[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            features_rest = features_rest.reshape(
+                (features_rest.shape[0], 1, num_rest_features)
+            )
 
         scale_names = [
             p.name
@@ -457,12 +646,25 @@ class BetaModel:
             .contiguous()
             .requires_grad_(True)
         )
-        self._sb_params = nn.Parameter(
-            torch.tensor(sb_params, dtype=torch.float, device="cuda")
-            .transpose(1, 2)
-            .contiguous()
-            .requires_grad_(True)
-        )
+        
+        if self.use_beta:
+            self._sb_params = nn.Parameter(
+                torch.tensor(sb_params, dtype=torch.float, device="cuda")
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
+        else:
+            self._features_dc = nn.Parameter(
+                torch.tensor(features_dc, dtype=torch.float, device="cuda")
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._features_rest = nn.Parameter(
+                torch.tensor(features_rest, dtype=torch.float, device="cuda")
+                .contiguous()
+                .requires_grad_(True)
+            )
         self._opacity = nn.Parameter(
             torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(
                 True
@@ -480,6 +682,7 @@ class BetaModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+    # still idk whats going on with this load_png method
     def load_png(self, path):
         with open(os.path.join(path, "meta.json"), "r") as f:
             meta = json.load(f)
@@ -623,42 +826,75 @@ class BetaModel:
         new_sb_params,
         new_opacities,
         new_betas,
+        new_features_dc,
+        new_features_rest,
         new_scaling,
         new_rotation,
         reset_params=True,
     ):
-        d = {
-            "xyz": new_xyz,
-            "sh0": new_sh0,
-            "shN": new_shN,
-            "sb_params": new_sb_params,
-            "opacity": new_opacities,
-            "beta": new_betas,
-            "scaling": new_scaling,
-            "rotation": new_rotation,
-        }
+        if self.use_beta:
+            d = {
+                "xyz": new_xyz,
+                "sh0": new_sh0,
+                "shN": new_shN,
+                "sb_params": new_sb_params,
+                "opacity": new_opacities,
+                "beta": new_betas,
+                "scaling": new_scaling,
+                "rotation": new_rotation,
+            }
+        else:
+            d = {
+                "xyz": new_xyz,
+                "sh0": new_sh0,
+                "shN": new_shN,
+                "features_dc": new_features_dc,
+                "features_rest": new_features_rest,
+                "opacity": new_opacities,
+                "beta": new_betas,
+                "scaling": new_scaling,
+                "rotation": new_rotation,
+            }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._sh0 = optimizable_tensors["sh0"]
         self._shN = optimizable_tensors["shN"]
-        self._sb_params = optimizable_tensors["sb_params"]
+        if self.use_beta:
+            self._sb_params = optimizable_tensors["sb_params"]
+        else:
+            self._features_dc = optimizable_tensors["features_dc"]
+            self._features_rest = optimizable_tensors["features_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._beta = optimizable_tensors["beta"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
     def replace_tensors_to_optimizer(self, inds=None):
-        tensors_dict = {
-            "xyz": self._xyz,
-            "sh0": self._sh0,
-            "shN": self._shN,
-            "sb_params": self._sb_params,
-            "opacity": self._opacity,
-            "beta": self._beta,
-            "scaling": self._scaling,
-            "rotation": self._rotation,
-        }
+        if self.use_beta:
+
+            tensors_dict = {
+                "xyz": self._xyz,
+                "sh0": self._sh0,
+                "shN": self._shN,
+                "sb_params": self._sb_params,
+                "opacity": self._opacity,
+                "beta": self._beta,
+                "scaling": self._scaling,
+                "rotation": self._rotation,
+            }
+        else:
+            tensors_dict = {
+                "xyz": self._xyz,
+                "sh0": self._sh0,
+                "shN": self._shN,
+                "features_dc": self._features_dc,
+                "features_rest": self._features_rest,
+                "opacity": self._opacity,
+                "beta": self._beta,
+                "scaling": self._scaling,
+                "rotation": self._rotation,
+            }
 
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -687,7 +923,11 @@ class BetaModel:
         self._xyz = optimizable_tensors["xyz"]
         self._sh0 = optimizable_tensors["sh0"]
         self._shN = optimizable_tensors["shN"]
-        self._sb_params = optimizable_tensors["sb_params"]
+        if self.use_beta:
+            self._sb_params = optimizable_tensors["sb_params"]
+        else:
+            self._features_dc = optimizable_tensors["features_dc"]
+            self._features_rest = optimizable_tensors["features_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._beta = optimizable_tensors["beta"]
         self._scaling = optimizable_tensors["scaling"]
@@ -707,16 +947,29 @@ class BetaModel:
             min=0.005,
         )
         new_opacity = self.inverse_opacity_activation(new_opacity)
-        return (
-            self._xyz[idxs],
-            self._sh0[idxs],
-            self._shN[idxs],
-            self._sb_params[idxs],
-            new_opacity,
-            self._beta[idxs],
-            self._scaling[idxs],
-            self._rotation[idxs],
-        )
+        if self.use_beta:
+            return (
+                self._xyz[idxs],
+                self._sh0[idxs],
+                self._shN[idxs],
+                self._sb_params[idxs],
+                new_opacity,
+                self._beta[idxs],
+                self._scaling[idxs],
+                self._rotation[idxs],
+            )
+        else:
+            return (
+                self._xyz[idxs],
+                self._sh0[idxs],
+                self._shN[idxs],
+                self._features_dc[idxs],
+                self._features_rest[idxs],
+                new_opacity,
+                self._beta[idxs],
+                self._scaling[idxs],
+                self._rotation[idxs],
+            )
 
     def _sample_alives(self, probs, num, alive_indices=None):
         probs = probs / (probs.sum() + torch.finfo(torch.float32).eps)
@@ -744,16 +997,29 @@ class BetaModel:
             alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0]
         )
 
-        (
-            self._xyz[dead_indices],
-            self._sh0[dead_indices],
-            self._shN[dead_indices],
-            self._sb_params[dead_indices],
-            self._opacity[dead_indices],
-            self._beta[dead_indices],
-            self._scaling[dead_indices],
-            self._rotation[dead_indices],
-        ) = self._update_params(reinit_idx, ratio=ratio)
+        if self.use_beta:
+            (
+                self._xyz[dead_indices],
+                self._sh0[dead_indices],
+                self._shN[dead_indices],
+                self._sb_params[dead_indices],
+                self._opacity[dead_indices],
+                self._beta[dead_indices],
+                self._scaling[dead_indices],
+                self._rotation[dead_indices],
+            ) = self._update_params(reinit_idx, ratio=ratio)
+        else:
+            (
+                self._xyz[dead_indices],
+                self._sh0[dead_indices],
+                self._shN[dead_indices],
+                self._features_dc[dead_indices],
+                self._features_rest[dead_indices],
+                self._opacity[dead_indices],
+                self._beta[dead_indices],
+                self._scaling[dead_indices],
+                self._rotation[dead_indices],
+            ) = self._update_params(reinit_idx, ratio=ratio)
 
         self._opacity[reinit_idx] = self._opacity[dead_indices]
 
@@ -771,30 +1037,58 @@ class BetaModel:
         probs = self.get_opacity.squeeze(-1)
         add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
 
-        (
-            new_xyz,
-            new_sh0,
-            new_shN,
-            new_sb_params,
-            new_opacity,
-            new_beta,
-            new_scaling,
-            new_rotation,
-        ) = self._update_params(add_idx, ratio=ratio)
+        if self.use_beta:
+            (
+                new_xyz,
+                new_sh0,
+                new_shN,
+                new_sb_params,
+                new_opacity,
+                new_beta,
+                new_scaling,
+                new_rotation,
+            ) = self._update_params(add_idx, ratio=ratio)
+        else:
+            (
+                new_xyz,
+                new_sh0,
+                new_shN,
+                new_features_dc,
+                new_features_rest,
+                new_opacity,
+                new_beta,
+                new_scaling,
+                new_rotation,
+            ) = self._update_params(add_idx, ratio=ratio)
 
         self._opacity[add_idx] = new_opacity
 
-        self.densification_postfix(
-            new_xyz,
-            new_sh0,
-            new_shN,
-            new_sb_params,
-            new_opacity,
-            new_beta,
-            new_scaling,
-            new_rotation,
-            reset_params=False,
-        )
+        if self.use_beta:
+            self.densification_postfix(
+                new_xyz,
+                new_sh0,
+                new_shN,
+                new_sb_params,
+                new_opacity,
+                new_beta,
+                new_scaling,
+                new_rotation,
+                reset_params=False,
+            )
+        else:
+            self.densification_postfix(
+                new_xyz,
+                new_sh0,
+                new_shN,
+                new_features_dc,
+                new_features_rest,
+                new_opacity,
+                new_beta,
+                new_scaling,
+                new_rotation,
+                reset_params=False,
+            )
+
         self.replace_tensors_to_optimizer(inds=add_idx)
 
         return num_gs
@@ -814,25 +1108,57 @@ class BetaModel:
         K[1, 2] = viewpoint_camera.image_height / 2
         K[2, 2] = 1.0
 
-        rgbs, alphas, meta = rasterization(
-            means=self.get_xyz[mask],
-            quats=self.get_rotation[mask],
-            scales=self.get_scaling[mask],
-            opacities=self.get_opacity.squeeze()[mask],
-            betas=self.get_beta.squeeze()[mask],
-            colors=self.get_shs[mask],
-            viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
-            Ks=K.unsqueeze(0),
-            width=viewpoint_camera.image_width,
-            height=viewpoint_camera.image_height,
-            backgrounds=self.background.unsqueeze(0),
-            render_mode=render_mode,
-            covars=None,
-            sh_degree=self.active_sh_degree,
-            sb_number=self.sb_number,
-            sb_params=self.get_sb_params[mask],
-            packed=False,
-        )
+        if self.use_beta:
+            rgbs, alphas, meta = rasterization(
+                means=self.get_xyz[mask],
+                quats=self.get_rotation[mask],
+                scales=self.get_scaling[mask],
+                opacities=self.get_opacity.squeeze()[mask],
+                betas=self.get_beta.squeeze()[mask],
+                colors=self.get_shs[mask],
+                viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=viewpoint_camera.image_width,
+                height=viewpoint_camera.image_height,
+                backgrounds=self.background.unsqueeze(0),
+                render_mode=render_mode,
+                covars=None,
+                sh_degree=self.active_sh_degree,
+                sb_number=self.sb_number,
+                sb_params=self.get_sb_params[mask],
+                packed=False,
+            )
+        else:
+            # calc colors with nasg function
+            dir_pp = self.get_xyz[mask] - viewpoint_camera.get_camera_center().unsqueeze(0)
+            dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-8)
+
+            if self.active_sh_degree > 0:
+                colors = nasg(dir_pp_normalized, self._features_rest[mask], self.active_sh_degree, self.max_sh_degree)
+                colors += self._features_dc[mask]
+            else:
+                colors = self._features_dc[mask].expand(-1, 3)
+                colors = torch.clamp_min(colors, 0.0)
+
+            rgbs, alphas, meta = rasterization(
+                means=self.get_xyz[mask],
+                quats=self.get_rotation[mask],
+                scales=self.get_scaling[mask],
+                opacities=self.get_opacity.squeeze()[mask],
+                betas=self.get_beta.squeeze()[mask],
+                colors=colors,
+                viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=viewpoint_camera.image_width,
+                height=viewpoint_camera.image_height,
+                backgrounds=self.background.unsqueeze(0),
+                render_mode=render_mode,
+                covars=None,
+                sh_degree=None,
+                sb_number=None,
+                sb_params=None,
+                packed=False,
+            )
 
         # # Convert from N,H,W,C to N,C,H,W format
         rgbs = rgbs.permute(0, 3, 1, 2).contiguous()[0]
@@ -874,28 +1200,61 @@ class BetaModel:
             torch.tensor(render_tab_state.backgrounds, device="cuda") / 255.0
         )
 
-        render_colors, alphas, meta = rasterization(
-            means=xyz[mask],
-            quats=self.get_rotation[mask],
-            scales=self.get_scaling[mask],
-            opacities=self.get_opacity.squeeze()[mask],
-            betas=self.get_beta.squeeze()[mask],
-            colors=self.get_shs[mask],
-            viewmats=torch.linalg.inv(c2w).unsqueeze(0),
-            Ks=K.unsqueeze(0),
-            width=W,
-            height=H,
-            backgrounds=self.background.unsqueeze(0),
-            render_mode=render_mode if render_mode != "Alpha" else "RGB",
-            covars=None,
-            sh_degree=self.active_sh_degree,
-            sb_number=self.sb_number,
-            sb_params=self.get_sb_params[mask],
-            packed=False,
-            near_plane=render_tab_state.near_plane,
-            far_plane=render_tab_state.far_plane,
-            radius_clip=render_tab_state.radius_clip,
-        )
+        if self.use_beta:
+            render_colors, alphas, meta = rasterization(
+                means=xyz[mask],
+                quats=self.get_rotation[mask],
+                scales=self.get_scaling[mask],
+                opacities=self.get_opacity.squeeze()[mask],
+                betas=self.get_beta.squeeze()[mask],
+                colors=self.get_shs[mask],
+                viewmats=torch.linalg.inv(c2w).unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=W,
+                height=H,
+                backgrounds=self.background.unsqueeze(0),
+                render_mode=render_mode if render_mode != "Alpha" else "RGB",
+                covars=None,
+                sh_degree=self.active_sh_degree,
+                sb_number=self.sb_number,
+                sb_params=self.get_sb_params[mask],
+                packed=False,
+                near_plane=render_tab_state.near_plane,
+                far_plane=render_tab_state.far_plane,
+                radius_clip=render_tab_state.radius_clip,
+            )
+        else:
+            # calc colors with nasg function
+            dir_pp = self.get_xyz[mask] - camera_state.get_camera_center().unsqueeze(0)
+            dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-8)
+
+            if self.active_sh_degree > 0:
+                colors = nasg(dir_pp_normalized, self._features_rest[mask], self.active_sh_degree, self.max_sh_degree)
+                colors += self._features_dc[mask]
+            else:
+                colors = self._features_dc[mask].expand(-1, 3)
+                colors = torch.clamp_min(colors, 0.0)
+
+            render_colors, alphas, meta = rasterization(
+                means=self.get_xyz[mask],
+                quats=self.get_rotation[mask],
+                scales=self.get_scaling[mask],
+                opacities=self.get_opacity.squeeze()[mask],
+                betas=self.get_beta.squeeze()[mask],
+                colors=colors,
+                viewmats=torch.linalg.inv(c2w).unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=W,
+                height=H,
+                backgrounds=self.background.unsqueeze(0),
+                render_mode=render_mode,
+                covars=None,
+                sh_degree=None,
+                sb_number=None,
+                sb_params=None,
+                packed=False,
+            )
+
         render_tab_state.total_count_number = len(self.get_xyz)
         render_tab_state.rendered_count_number = (meta["radii"] > 0).sum().item()
 

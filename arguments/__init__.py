@@ -53,6 +53,7 @@ class ParamGroup:
 
 class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
+        self.use_beta = True
         self.sh_degree = 0
         self.sb_number = 2
         self._source_path = ""
