@@ -1,0 +1,3 @@
+[submodule "submodules/gsplat"]
+	path = submodules/gsplat
+	url = https://github.com/ewaMiazga/gsplat-radiance.git
