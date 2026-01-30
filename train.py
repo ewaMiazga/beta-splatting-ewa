@@ -160,8 +160,8 @@ def training(args):
             beta_model.optimizer.zero_grad(set_to_none=True)
 
             # scheduler on lr for any other param then xyz
-            # if iteration > 7000:
-            #     beta_model.lr_scheduler.step()
+            if iteration > 7000:
+                beta_model.lr_scheduler.step()
 
             if not args.disable_viewer:
                 num_train_rays_per_step = (

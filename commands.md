@@ -5,7 +5,7 @@ python train.py --source_path ../data-ready/tandt/truck/ --model_path output_tru
 
 # To eval for beta mode
 bash```
-python eval.py --model_path output_truck_sb_2 --iteration 30000 --rendering_mode beta --sh_degree 2 --source_path ../data-ready/tandt/truck
+python eval.py --model_path output_truck_sb_2 --iteration 30000 --rendering_mode beta --sh_degree 0 --sb_number 2 --source_path ../data-ready/tandt/truck
 ```
 # To train for nasg mode
 bash``` 

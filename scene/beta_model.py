@@ -254,10 +254,6 @@ class BetaModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
-        # self.use_beta = True
-        # self.max_sh_degree = 0
-        # self.sb_number = 2
-
         print("Use beta:", self.use_beta)
         print("Use GMM colors:", self.use_gmm_colors)
         print("Use GMM colors CUDA:", self.use_gmm_colors_cuda)
@@ -266,7 +262,6 @@ class BetaModel:
             print("sb_number:", self.sb_number)
         else:
             print("max_sh_degree:", self.max_sh_degree)
-        #print("sb_number:", self.sb_number)
 
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -348,13 +343,7 @@ class BetaModel:
 
             # Finally, append base color at the very end
             features[:, 0, -3:] = fused_color
-        
-        #if self.use_beta:
-        #    print("First SH coefficients:", shs[0, :, :])
-        #elif self.use_gmm_colors_cuda:
-        #    print("First features:", features[0, :])
-        #else:
-        #    print("First features:", shs[0, :])
+    
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -537,15 +526,15 @@ class BetaModel:
             max_steps=training_args.position_lr_max_steps,
         )
 
-        # def lr_lambda(step):
-        #     T_max = training_args.iterations
-        #     return 0.5 * (1 + math.cos(math.pi * step / T_max))  # cosine decay
+        def lr_lambda(step):
+            T_max = training_args.iterations
+            return 0.5 * (1 + math.cos(math.pi * step / T_max))  # cosine decay
 
-        # # Create scheduler that only adjusts specific groups
-        # self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        #     self.optimizer,
-        #     lr_lambda=[(lambda step: 1.0 if pg["name"] == "xyz" else lr_lambda(step)) for pg in self.optimizer.param_groups]
-        # )
+        # Create scheduler that only adjusts specific groups
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=[(lambda step: 1.0 if pg["name"] == "xyz" else lr_lambda(step)) for pg in self.optimizer.param_groups]
+        )
 
     def update_learning_rate(self, iteration):
         """Learning rate scheduling per step"""
