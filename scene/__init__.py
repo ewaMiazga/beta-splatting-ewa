@@ -25,7 +25,8 @@ from utils.image_utils import psnr
 from lpipsPyTorch import lpips
 from fused_ssim import fused_ssim
 from tqdm import tqdm
-
+import numpy as np
+from PIL import Image
 
 class Scene:
     beta_model: BetaModel
@@ -76,7 +77,7 @@ class Scene:
             camlist = []
             if scene_info.test_cameras:
                 camlist.extend(scene_info.test_cameras)
-            if scene_info.train_cameras:
+            if scene_info.train_cameras and not args.eval:
                 camlist.extend(scene_info.train_cameras)
             for id, cam in enumerate(camlist):
                 json_cams.append(camera_to_JSON(id, cam))
@@ -146,13 +147,29 @@ class Scene:
     @torch.no_grad()
     def eval(self):
         torch.cuda.empty_cache()
+        print("Starting evaluation...")
         psnr_test = 0.0
         ssim_test = 0.0
         lpips_test = 0.0
         test_view_stack = self.getTestCameras()
         for idx, viewpoint in tqdm(enumerate(test_view_stack)):
             image = torch.clamp(self.beta_model.render(viewpoint)["render"], 0.0, 1.0)
+
+            # save image in render_test/
+
+            os.makedirs(os.path.join(self.model_path, "render_test"), exist_ok=True)
+            image_cpu = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            image_cpu = Image.fromarray(image_cpu)
+            image_cpu.save(os.path.join(self.model_path, "render_test", f"image_{idx}.png"))
+
             gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+
+            # save gt to gt_test/
+            os.makedirs(os.path.join(self.model_path, "gt_test"), exist_ok=True)
+            gt_image_cpu = (gt_image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            gt_image_cpu = Image.fromarray(gt_image_cpu)
+            gt_image_cpu.save(os.path.join(self.model_path, "gt_test", f"image_{idx}.png"))
+
             psnr_test += psnr(image, gt_image).mean()
             ssim_test += fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
             lpips_test += lpips(image, gt_image, net_type="vgg").mean()

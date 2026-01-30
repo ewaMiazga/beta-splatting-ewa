@@ -53,7 +53,6 @@ class ParamGroup:
 
 class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
-        self.use_beta = True
         self.sh_degree = 0
         self.sb_number = 2
         self._source_path = ""
@@ -65,11 +64,35 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.cap_max = 1000000
         self.init_type = "sfm"
+        
         super().__init__(parser, "Loading Parameters", sentinel)
+        
+        # Add custom argument for rendering_mode with choices (after super init)
+        if not sentinel:
+            group = parser.add_argument_group("Loading Parameters")
+            group.add_argument(
+                "--rendering_mode",
+                type=str,
+                required=True,
+                choices=["beta", "gmm", "gmm_cuda"],
+                help="Rendering mode (REQUIRED): 'beta' (SH+beta), 'gmm' (NASG Python), or 'gmm_cuda' (NASG CUDA)"
+            )
 
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        
+        # Set boolean flags based on rendering_mode
+        rendering_mode = getattr(args, 'rendering_mode', 'beta')
+        g.use_beta = (rendering_mode == "beta")
+        g.use_gmm_colors = (rendering_mode == "gmm")
+        g.use_gmm_colors_cuda = (rendering_mode == "gmm_cuda")
+        
+        # Also set on args for direct access
+        args.use_beta = g.use_beta
+        args.use_gmm_colors = g.use_gmm_colors
+        args.use_gmm_colors_cuda = g.use_gmm_colors_cuda
+        
         return g
 
 
@@ -87,8 +110,11 @@ class OptimizationParams(ParamGroup):
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
-        self.sh_lr = 0.0025
+        self.sh_lr = 0.00025
         self.sb_params_lr = 0.0025
+        self.features_pos_lr = 0.0025
+        self.features_shape_lr = 0.0025
+        self.features_weight_lr = 0.0025
         self.opacity_lr = 0.05
         self.beta_lr = 0.001
         self.scaling_lr = 0.005

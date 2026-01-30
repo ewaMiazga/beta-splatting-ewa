@@ -10,6 +10,7 @@
 #
 
 import os
+from submodules import gsplat
 import torch
 from random import randint
 
@@ -26,12 +27,13 @@ import viser
 from scene.beta_viewer import BetaViewer
 import time
 import json
+import importlib
 
 
 def training(args):
     first_iter = 0
     prepare_output_and_logger(args)
-    beta_model = BetaModel(args.sh_degree, args.sb_number, args.use_beta)
+    beta_model = BetaModel(args.sh_degree, args.sb_number, args.use_beta, args.use_gmm_colors, args.use_gmm_colors_cuda)
     scene = Scene(args, beta_model)
     beta_model.training_setup(args)
     if args.start_checkpoint:
@@ -157,6 +159,10 @@ def training(args):
             beta_model.optimizer.step()
             beta_model.optimizer.zero_grad(set_to_none=True)
 
+            # scheduler on lr for any other param then xyz
+            # if iteration > 7000:
+            #     beta_model.lr_scheduler.step()
+
             if not args.disable_viewer:
                 num_train_rays_per_step = (
                     gt_image.numel()
@@ -228,6 +234,9 @@ def prepare_output_and_logger(args):
 
 if __name__ == "__main__":
     # Set up command line argument parser
+    
+    print("gsplat module file:", gsplat.__file__)
+
     parser = ArgumentParser(description="Training script parameters")
     ModelParams(parser), OptimizationParams(parser), ViewerParams(parser)
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
@@ -235,12 +244,11 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument(
-        "--no-compress",
-        action="store_false",
-        dest="compress",
-        help="Disable compression (compression is on by default)",
+        "--compress",
+        action="store_true",
+        help="Enable compression (compression is off by default)",
     )
-    parser.set_defaults(compress=True)
+    parser.set_defaults(compress=False)
     parser.add_argument(
         "--share_url", action="store_true", help="Share URL for the viewer"
     )
@@ -250,6 +258,20 @@ if __name__ == "__main__":
         help="Center the model in the viewer",
     )
     args = parser.parse_args(sys.argv[1:])
+
+    # Set rendering mode boolean flags - all False by default
+    rendering_mode = getattr(args, 'rendering_mode', None)
+    
+    if rendering_mode is None:
+        print("ERROR: --rendering_mode must be specified. Choose: 'beta', 'gmm', or 'gmm_cuda'")
+        sys.exit(1)
+    
+    args.use_beta = (rendering_mode == "beta")
+    args.use_gmm_colors = (rendering_mode == "gmm")
+    args.use_gmm_colors_cuda = (rendering_mode == "gmm_cuda")
+    
+    print(f"Rendering mode: {rendering_mode}")
+    print(f"Flags - use_beta: {args.use_beta}, use_gmm_colors: {args.use_gmm_colors}, use_gmm_colors_cuda: {args.use_gmm_colors_cuda}")
 
     args.save_iterations.append(args.iterations)
 

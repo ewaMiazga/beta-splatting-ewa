@@ -68,17 +68,39 @@ class BetaModel:
         self.sb_params_activation = sb_params_activation
         self.beta_activation = beta_activation
 
-    def __init__(self, sh_degree: int = 0, sb_number: int = 2, use_beta: bool = True):
+
+        if not self.use_beta:
+            self.position_size = 3
+            self.shape_size = 2
+            self.color_size = 3
+            self.params_size = 8  # total params per degree: position + shape + weight
+
+            def pos_activation(x):
+                return torch.tanh(x)
+
+            def weight_activation(x):
+                return torch.tanh(x)
+
+            self.pos_activation = lambda x: torch.tanh(x)
+            self.weight_activation = lambda x: torch.tanh(x)
+
+    def __init__(self, sh_degree: int = 0, sb_number: int = 2, use_beta: bool = False, use_gmm_colors: bool = False, use_gmm_colors_cuda: bool = False):
         self.use_beta = use_beta
+        self.use_gmm_colors = use_gmm_colors
+        self.use_gmm_colors_cuda = use_gmm_colors_cuda
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree
-        self.sb_number = sb_number
+        if self.use_beta:
+            self.max_sh_degree = sh_degree
+            self.sb_number = sb_number
+        else:
+            self.max_sh_degree = sb_number
+        
         self._xyz = torch.empty(0)
         self._sh0 = torch.empty(0)
         self._shN = torch.empty(0)
         self._sb_params = torch.empty(0)
-        self.features_dc = torch.empty(0)
-        self.features_rest = torch.empty(0)
+        self._features_dc = torch.empty(0)
+        self._features_rest = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -86,6 +108,7 @@ class BetaModel:
         self.background = torch.empty(0)
         self.optimizer = None
         self.spatial_lr_scale = 0
+
         self.setup_functions()
 
     def capture(self):
@@ -110,8 +133,10 @@ class BetaModel:
                 self._sh0,
                 self._shN,
                 self._sb_params,
-                self.features_dc,
-                self.features_rest,
+                self._features_dc,
+                self._features_pos,
+                self._features_shape,
+                self._features_weight,
                 self._scaling,
                 self._rotation,
                 self._opacity,
@@ -142,8 +167,10 @@ class BetaModel:
                 self._sh0,
                 self._shN,
                 self._sb_params,
-                self.features_dc,
-                self.features_rest,
+                self._features_dc,
+                self._features_pos,
+                self._features_shape,
+                self._features_weight,
                 self._scaling,
                 self._rotation,
                 self._opacity,
@@ -175,9 +202,39 @@ class BetaModel:
     @property
     def get_sb_params(self):
         return self.sb_params_activation(self._sb_params)
-    
-    ## get features 
-    ## get pos, shape, weights
+
+    @property
+    def get_features_pos(self):
+        return self.pos_activation(self._features_pos)
+
+    @property
+    def get_features_weight(self):
+        return self.weight_activation(self._features_weight)
+
+    @property
+    def get_features(self):
+        sh0 = self._sh0
+        
+        if self.use_gmm_colors:
+            # Linear layout: [sh0, all_pos, all_shape, all_weight]
+            rest = torch.cat((
+                self.get_features_pos, 
+                self._features_shape, 
+                self.get_features_weight
+            ), dim=1)
+            return torch.cat((sh0, rest), dim=1)
+        
+        elif self.use_gmm_colors_cuda:
+            # Interleaved layout: [pos, shape, weight] * lobes + base_color
+            pos = self.get_features_pos.reshape(-1, self.max_sh_degree, self.position_size)
+            shape = self._features_shape.reshape(-1, self.max_sh_degree, self.shape_size)
+            weight = self.get_features_weight.reshape(-1, self.max_sh_degree, self.color_size)
+            
+            # Interleave: [pos, shape, weight] for each lobe
+            interleaved = torch.cat([pos, shape, weight], dim=2)  # [N, max_sh_degree, params_size]
+            flattened = interleaved.reshape(-1, 1, self.max_sh_degree * self.params_size)# [N, 1, max_sh_degree * params_size]
+
+            return torch.cat((sh0.reshape(-1, 1, 3), flattened), dim=2)  # [N, 1, total_params_per_point]
 
     @property
     def get_opacity(self):
@@ -197,6 +254,20 @@ class BetaModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
+        # self.use_beta = True
+        # self.max_sh_degree = 0
+        # self.sb_number = 2
+
+        print("Use beta:", self.use_beta)
+        print("Use GMM colors:", self.use_gmm_colors)
+        print("Use GMM colors CUDA:", self.use_gmm_colors_cuda)
+        if self.use_beta:
+            print("max_sh_degree:", self.max_sh_degree)
+            print("sb_number:", self.sb_number)
+        else:
+            print("max_sh_degree:", self.max_sh_degree)
+        #print("sb_number:", self.sb_number)
+
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
 
@@ -209,36 +280,81 @@ class BetaModel:
             )
             shs[:, :3, 0] = fused_color
             shs[:, 3:, 1:] = 0.0
+
+            # [r, g, b, theta, phi, beta]
+            sb_params = torch.zeros(
+                (fused_point_cloud.shape[0], self.sb_number, 6), device="cuda"
+            )
+
+            # Initialize theta and phi uniformly across the sphere for each primitive and view-dependent parameter
+            theta = torch.pi * torch.rand(
+                fused_point_cloud.shape[0], self.sb_number
+            )  # Uniform in [0, pi]
+            phi = (
+                2 * torch.pi * torch.rand(fused_point_cloud.shape[0], self.sb_number)
+            )  # Uniform in [0, 2pi]
+
+            sb_params[:, :, 3] = theta
+            sb_params[:, :, 4] = phi
         
-        else:
+        elif self.use_gmm_colors:
             print("Initializing features for non-beta mode")
-            ### Initialization for features 
-            # TODO:
-            # fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
-            # features = (torch.rand((fused_color.shape[0], 1, (self.max_sh_degree) * self.params_size + 3)).float().cuda() * 2.0 - 1.0) * 2.0
+            print("# Nasg lobes is: ", self.max_sh_degree)
+            fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
+            shs = (
+                torch.rand((fused_color.shape[0], 1, (self.max_sh_degree) * self.params_size + 3))
+                .float()
+                .cuda() * 2.0 - 1.0) * 2.0
             
-            # pos_start = 0
-            # pos_end = self.position_size * self.max_sh_degree     
-            # features[:, :, pos_start:pos_end] = 0.0 # + 0.1 * torch.randn_like(features[:, :, pos_start:pos_end]) # positions
+            pos_start = 0
+            pos_end = self.position_size * self.max_sh_degree     
+            shs[:, :, pos_start:pos_end] = 0.0 # + 0.1 * torch.randn_like(features[:, :, pos_start:pos_end]) # positions
             
-            # weights_start = -3 + (-1) * self.max_sh_degree * self.color_size #* self.max_sh_degree - self.color_size
-            # weights_end   = -3
-            # features[:, :, weights_start:weights_end] = 0.5 #0.5 + 0.05 * torch.randn_like(features[:, :, weights_start:weights_end]) # weights
+            weight_start = -3 + (-1) * self.max_sh_degree * self.color_size #* self.max_sh_degree - self.color_size
+            weight_end   = -3
+            shs[:, :, weight_start:weight_end] = 0.5 #0.5 + 0.05 * torch.randn_like(features[:, :, weights_start:weights_end]) # weights
+
+            shape_start = self.position_size * self.max_sh_degree
+            shape_end   = -3 + (-1) * self.max_sh_degree * self.color_size #-3 * self.max_sh_degree - self.color_size
+            if self.max_sh_degree  == 0:
+                shape_end = 0
             
-            # shape_start = self.position_size * self.max_sh_degree
-            # shape_end   = -3 + (-1) * self.max_sh_degree * self.color_size #-3 * self.max_sh_degree - self.color_size
-            # if self.max_sh_degree  == 0:
-            #     shape_end = 0
-            
-            # # Initialize ALL shape parameters for all degrees
-            # # Calculate shape params per degree: total - position - color
-            # shape_params_per_deg = self.params_size - self.position_size - self.color_size
-            # for deg in range(self.max_sh_degree):
-            #     for param_idx in range(shape_params_per_deg):
-            #         idx = shape_start + deg * shape_params_per_deg + param_idx
-            #         features[:,:, idx] = math.log(0.5)  # Initialize all shape params to log(0.5)
-            # 
-            # features[:, 0, -3:] = fused_color #torch.log(fused_color + 1.0)
+            # Initialize ALL shape parameters for all degrees
+            # Calculate shape params per degree: total - position - color
+            shape_params_per_deg = self.shape_size
+            for deg in range(self.max_sh_degree):
+                for param_idx in range(shape_params_per_deg):
+                    idx = shape_start + deg * shape_params_per_deg + param_idx
+                    shs[:,:, idx] = math.log(0.5)  # Initialize all shape params to log(0.5)
+
+            shs[:, 0, -3:] = fused_color #torch.log(fused_color + 1.0)
+
+        elif self.use_gmm_colors_cuda:
+            # fused_color: [N, 3]
+            # shs: [N, 1, total_params_per_point]
+
+            fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
+            # Allocate tensor
+            features = torch.empty((fused_color.shape[0], 1, (self.max_sh_degree) * self.params_size + 3)).float().cuda()
+
+            for i in range(self.max_sh_degree):
+                start = i * self.params_size
+                # positions
+                features[:, 0, start : start + self.position_size] = 0.0
+                # shape
+                features[:, 0, start + self.position_size : start + self.position_size + self.shape_size] = math.log(0.5)
+                # weight
+                features[:, 0, start + self.position_size + self.shape_size : start + self.position_size + self.shape_size + self.color_size] = 0.5
+
+            # Finally, append base color at the very end
+            features[:, 0, -3:] = fused_color
+        
+        #if self.use_beta:
+        #    print("First SH coefficients:", shs[0, :, :])
+        #elif self.use_gmm_colors_cuda:
+        #    print("First features:", features[0, :])
+        #else:
+        #    print("First features:", shs[0, :])
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -258,41 +374,67 @@ class BetaModel:
 
         ## Betas initialization
         betas = torch.zeros_like(opacities)
-
-        if self.use_beta:
-            # [r, g, b, theta, phi, beta]
-            sb_params = torch.zeros(
-                (fused_point_cloud.shape[0], self.sb_number, 6), device="cuda"
-        )
-
-            # Initialize theta and phi uniformly across the sphere for each primitive and view-dependent parameter
-            theta = torch.pi * torch.rand(
-                fused_point_cloud.shape[0], self.sb_number
-            )  # Uniform in [0, pi]
-            phi = (
-                2 * torch.pi * torch.rand(fused_point_cloud.shape[0], self.sb_number)
-            )  # Uniform in [0, 2pi]
-
-            sb_params[:, :, 3] = theta
-            sb_params[:, :, 4] = phi
-
-        else:
-            ## store feattures
-            features = None
-
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._sh0 = nn.Parameter(
-            shs[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
-        )
-        self._shN = nn.Parameter(
-            shs[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
-        )
 
         if self.use_beta:
+            self._sh0 = nn.Parameter(
+            shs[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
+            )
+            self._shN = nn.Parameter(
+            shs[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+            )
             self._sb_params = nn.Parameter(sb_params.requires_grad_(True))
-        else:
-            self._features_dc = nn.Parameter(features[:, :, :3].requires_grad_(True))
-            self._features_rest = nn.Parameter(features[:, :, 3:].requires_grad_(True))
+        elif self.use_gmm_colors:
+            self._sh0 = nn.Parameter(
+            shs[:, :, -3:].transpose(1, 2).contiguous().requires_grad_(True)
+            )
+            self._features_pos = nn.Parameter(
+            shs[:, :, pos_start:pos_end].transpose(1, 2).contiguous().requires_grad_(True)
+            )
+            self._features_shape = nn.Parameter(
+            shs[:, :, shape_start:shape_end].transpose(1, 2).contiguous().requires_grad_(True)
+            )
+            self._features_weight = nn.Parameter(
+            shs[:, :, weight_start:weight_end].transpose(1, 2).contiguous().requires_grad_(True)
+            )
+        elif self.use_gmm_colors_cuda:
+            self._sh0 = nn.Parameter(
+                features[:, :, -3:].transpose(1, 2).contiguous().requires_grad_(True)
+            )
+            
+            # Extract interleaved params: [pos, shape, weight] * max_sh_degree
+            params_only = features[:, 0, :-3]  # [N, max_sh_degree * params_size]
+            params_reshaped = params_only.reshape(
+                features.shape[0], self.max_sh_degree, self.params_size
+            )  # [N, max_sh_degree, params_size]
+            
+            # Extract each component type
+            pos = params_reshaped[:, :, 0:self.position_size]  # [N, max_sh_degree, 3]
+            shape = params_reshaped[:, :, self.position_size:self.position_size + self.shape_size]  # [N, max_sh_degree, 2]
+            weight = params_reshaped[:, :, self.position_size + self.shape_size:]  # [N, max_sh_degree, 3]
+            
+            # Reshape and store as parameters
+            self._features_pos = nn.Parameter(
+                pos.reshape(features.shape[0], self.max_sh_degree * self.position_size)
+                .unsqueeze(1)
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._features_shape = nn.Parameter(
+                shape.reshape(features.shape[0], self.max_sh_degree * self.shape_size)
+                .unsqueeze(1)
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._features_weight = nn.Parameter(
+                weight.reshape(features.shape[0], self.max_sh_degree * self.color_size)
+                .unsqueeze(1)
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
 
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
@@ -302,12 +444,13 @@ class BetaModel:
     def prune(self, live_mask):
         self._xyz = self._xyz[live_mask]
         self._sh0 = self._sh0[live_mask]
-        self._shN = self._shN[live_mask]
         if self.use_beta:
+            self._shN = self._shN[live_mask]
             self._sb_params = self._sb_params[live_mask]
         else:
-            self._features_dc = self._features_dc[live_mask]
-            self._features_rest = self._features_rest[live_mask]
+            self._features_pos = self._features_pos[live_mask]
+            self._features_shape = self._features_shape[live_mask]
+            self._features_weight = self._features_weight[live_mask]
         self._scaling = self._scaling[live_mask]
         self._rotation = self._rotation[live_mask]
         self._opacity = self._opacity[live_mask]
@@ -352,19 +495,21 @@ class BetaModel:
                     "lr": training_args.position_lr_init * self.spatial_lr_scale,
                     "name": "xyz",
                 },
-                ### is it even ??? -> understand if they are using SH, and for what if they do use SB
-                ## TODO:
                 {"params": [self._sh0], "lr": training_args.sh_lr, "name": "sh0"},
-                {"params": [self._shN], "lr": training_args.sh_lr / 20.0, "name": "shN"},
                 {
-                    "params": [self._features_dc],
-                    "lr": training_args.features_lr,
-                    "name": "features_dc",
+                    "params": [self._features_pos],
+                    "lr": training_args.features_pos_lr,
+                    "name": "features_pos",
                 },
                 {
-                    "params": [self._features_rest],
-                    "lr": training_args.features_lr,
-                    "name": "features_rest",
+                    "params": [self._features_shape],
+                    "lr": training_args.features_shape_lr,
+                    "name": "features_shape",
+                },
+                {
+                    "params": [self._features_weight],
+                    "lr": training_args.features_weight_lr,
+                    "name": "features_weight",
                 },
                 {
                     "params": [self._opacity],
@@ -392,6 +537,16 @@ class BetaModel:
             max_steps=training_args.position_lr_max_steps,
         )
 
+        # def lr_lambda(step):
+        #     T_max = training_args.iterations
+        #     return 0.5 * (1 + math.cos(math.pi * step / T_max))  # cosine decay
+
+        # # Create scheduler that only adjusts specific groups
+        # self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        #     self.optimizer,
+        #     lr_lambda=[(lambda step: 1.0 if pg["name"] == "xyz" else lr_lambda(step)) for pg in self.optimizer.param_groups]
+        # )
+
     def update_learning_rate(self, iteration):
         """Learning rate scheduling per step"""
         for param_group in self.optimizer.param_groups:
@@ -405,18 +560,16 @@ class BetaModel:
         # All channels except the 3 DC
         for i in range(self._sh0.shape[1] * self._sh0.shape[2]):
             l.append("sh0_{}".format(i))
-        for i in range(self._shN.shape[1] * self._shN.shape[2]):
-            l.append("shN_{}".format(i))
 
         if self.use_beta:
+            for i in range(self._shN.shape[1] * self._shN.shape[2]):
+                l.append("shN_{}".format(i))
             for i in range(self._sb_params.shape[1] * self._sb_params.shape[2]):
                 l.append("sb_params_{}".format(i))
         else:
-            ### TODO: Is it correct? 
-            for i in range(self._features_dc.shape[1] * self._features_dc.shape[2]):
-                l.append("features_dc_{}".format(i))
-            for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
-                l.append("features_rest_{}".format(i))
+            ### TODO: Is it correct?
+            for i in range(self._features_pos.shape[1]*self._features_pos.shape[2] + self._features_shape.shape[1]*self._features_shape.shape[2] + self._features_weight.shape[1]*self._features_weight.shape[2]):
+                l.append('f_rest_{}'.format(i))
         l.append("opacity")
         l.append("beta")
         for i in range(self._scaling.shape[1]):
@@ -438,15 +591,24 @@ class BetaModel:
             .cpu()
             .numpy()
         )
-        shN = (
-            self._shN.detach()
+        
+        if self.use_beta:
+            sh0 = (
+            self._sh0.detach()
             .transpose(1, 2)
             .flatten(start_dim=1)
             .contiguous()
             .cpu()
             .numpy()
-        )
-        if self.use_beta:
+            )
+            shN = (
+                self._shN.detach()
+                .transpose(1, 2)
+                .flatten(start_dim=1)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
             sb_params = (
                 self._sb_params.transpose(1, 2)
                 .detach()
@@ -456,23 +618,24 @@ class BetaModel:
                 .numpy()
             )
         else:
-            sb_params_dc = (
-                self._features_dc.transpose(1, 2)
-                .detach()
+            sh0 = (
+                self._sh0.detach()
                 .flatten(start_dim=1)
                 .contiguous()
                 .cpu()
                 .numpy()
             )
-            sb_params_rest = (
-                self._features_rest.transpose(1, 2)
-                .detach()
-                .flatten(start_dim=1)
-                .contiguous()
-                .cpu()
-                .numpy()
-            )
-            sb_params = np.concatenate((sb_params_dc, sb_params_rest), axis=1)
+            if self.use_gmm_colors_cuda:
+                # Interleaved layout: [pos, shape, weight] * lobes
+                pos = self._features_pos.squeeze(-1).reshape(-1, self.max_sh_degree, self.position_size)
+                shape = self._features_shape.squeeze(-1).reshape(-1, self.max_sh_degree, self.shape_size)
+                weight = self._features_weight.squeeze(-1).reshape(-1, self.max_sh_degree, self.color_size)
+                interleaved = torch.cat([pos, shape, weight], dim=2)  # [N, max_sh_degree, params_size]
+                nasg_params = interleaved.reshape(-1, self.max_sh_degree * self.params_size).detach().cpu().numpy()
+            else:
+                # Linear layout: [all_pos, all_shape, all_weight]
+                nasg_params = torch.cat((self._features_pos, self._features_shape, self._features_weight), dim=1).detach().flatten(start_dim=1).contiguous().cpu().numpy()
+
         opacities = self._opacity.detach().cpu().numpy()
         betas = self._beta.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -483,10 +646,16 @@ class BetaModel:
         ]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            (xyz, normals, sh0, shN, sb_params, opacities, betas, scale, rotation),
-            axis=1,
-        )
+        if self.use_beta:
+            attributes = np.concatenate(
+                (xyz, normals, sh0, shN, sb_params, opacities, betas, scale, rotation),
+                axis=1,
+            )
+        else:
+            attributes = np.concatenate(
+                (xyz, normals, sh0, nasg_params, opacities, betas, scale, rotation),
+                axis=1,
+            )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
@@ -507,32 +676,54 @@ class BetaModel:
             )
             self.prune(mask.squeeze())
         meta = {}
-        param_dict = {
-            "xyz": self._xyz,
-            "sh0": self._sh0,
-            "shN": self._shN if self.max_sh_degree else None,
-            "opacity": self._opacity,
-            "beta": self._beta,
-            "scaling": self._scaling,
-            "rotation": self.get_rotation,
-            "sb_params": self._sb_params if self.sb_number else None,
-        }
-        param_dict = sort_param_dict(param_dict, n_sidelen)
-        for k in param_dict.keys():
-            if param_dict[k] is not None:
-                if k == "sb_params":
-                    for i in range(self.sb_number):
-                        meta[f"sb_{i}_color"] = compress_png(
-                            path, f"sb_{i}_color", param_dict[k][:, i, :3], n_sidelen
-                        )
+        if self.use_beta:
+            param_dict = {
+                "xyz": self._xyz,
+                "sh0": self._sh0,
+                "shN": self._shN if self.max_sh_degree else None,
+                "opacity": self._opacity,
+                "beta": self._beta,
+                "scaling": self._scaling,
+                "rotation": self.get_rotation,
+                "sb_params": self._sb_params if self.sb_number else None,
+            }
+            param_dict = sort_param_dict(param_dict, n_sidelen)
+            for k in param_dict.keys():
+                if param_dict[k] is not None:
+                    if k == "sb_params":
+                        for i in range(self.sb_number):
+                            meta[f"sb_{i}_color"] = compress_png(
+                                path, f"sb_{i}_color", param_dict[k][:, i, :3], n_sidelen
+                            )
 
-                        meta[f"sb_{i}_lobe"] = compress_png(
-                            path, f"sb_{i}_lobe", param_dict[k][:, i, 3:], n_sidelen
-                        )
-                elif k == "xyz":
-                    meta[k] = compress_png(path, k, param_dict[k], n_sidelen, bit=32)
-                else:
-                    meta[k] = compress_png(path, k, param_dict[k], n_sidelen)
+                            meta[f"sb_{i}_lobe"] = compress_png(
+                                path, f"sb_{i}_lobe", param_dict[k][:, i, 3:], n_sidelen
+                            )
+                    elif k == "xyz":
+                        meta[k] = compress_png(path, k, param_dict[k], n_sidelen, bit=32)
+                    else:
+                        meta[k] = compress_png(path, k, param_dict[k], n_sidelen)
+        else:
+            param_dict = {
+                "xyz": self._xyz,
+                "sh0": self._sh0,
+                "features_pos": self._features_pos if self.max_sh_degree else None,
+                "features_shape": self._features_shape if self.max_sh_degree else None,
+                "features_weight": self._features_weight if self.max_sh_degree else None,
+                "opacity": self._opacity,
+                "beta": self._beta,
+                "scaling": self._scaling,
+                "rotation": self.get_rotation,
+            }
+            param_dict = sort_param_dict(param_dict, n_sidelen)
+            for k in param_dict.keys():
+                if param_dict[k] is not None:
+                    if k in ["features_pos", "features_shape", "features_weight"]:
+                        meta[k] = compress_png(path, k, param_dict[k], n_sidelen)
+                    elif k == "xyz":
+                        meta[k] = compress_png(path, k, param_dict[k], n_sidelen, bit=32)
+                    else:
+                        meta[k] = compress_png(path, k, param_dict[k], n_sidelen)
 
         with open(os.path.join(path, "meta.json"), "w") as f:
             json.dump(meta, f)
@@ -553,25 +744,25 @@ class BetaModel:
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
         betas = np.asarray(plydata.elements[0]["beta"])[..., np.newaxis]
 
-        sh0 = np.zeros((xyz.shape[0], 3, 1))
-        sh0[:, 0, 0] = np.asarray(plydata.elements[0]["sh0_0"])
-        sh0[:, 1, 0] = np.asarray(plydata.elements[0]["sh0_1"])
-        sh0[:, 2, 0] = np.asarray(plydata.elements[0]["sh0_2"])
-
-        extra_f_names = [
-            p.name for p in plydata.elements[0].properties if p.name.startswith("shN_")
-        ]
-        extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-        assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
-        shs_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            shs_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        shs_extra = shs_extra.reshape(
-            (shs_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
-        )
-
         if self.use_beta:
+            sh0 = np.zeros((xyz.shape[0], 3, 1))
+            sh0[:, 0, 0] = np.asarray(plydata.elements[0]["sh0_0"])
+            sh0[:, 1, 0] = np.asarray(plydata.elements[0]["sh0_1"])
+            sh0[:, 2, 0] = np.asarray(plydata.elements[0]["sh0_2"])
+
+            extra_f_names = [
+                p.name for p in plydata.elements[0].properties if p.name.startswith("shN_")
+            ]
+            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
+            assert len(extra_f_names) == 3 * (self.max_sh_degree + 1) ** 2 - 3
+            shs_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+            for idx, attr_name in enumerate(extra_f_names):
+                shs_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+            shs_extra = shs_extra.reshape(
+                (shs_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1)
+            )
+
             extra_f_names = [
                 p.name
                 for p in plydata.elements[0].properties
@@ -585,33 +776,27 @@ class BetaModel:
             sb_params = sb_params.reshape((sb_params.shape[0], 6, self.sb_number))
 
         else:
-            extra_f_names = [
-                p.name
-                for p in plydata.elements[0].properties
-                if p.name.startswith("features_dc_")
-            ]
-            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-            num_dc_features = len(extra_f_names)
-            features_dc = np.zeros((xyz.shape[0], num_dc_features))
-            for idx, attr_name in enumerate(extra_f_names):
-                features_dc[:, idx] = np.asarray(plydata.elements[0][attr_name])
-            features_dc = features_dc.reshape(
-                (features_dc.shape[0], 1, num_dc_features)
-            )
+            sh0 = np.zeros((xyz.shape[0], 1, 3))
+            sh0[:, 0, 0] = np.asarray(plydata.elements[0]["sh0_0"])
+            sh0[:, 0, 1] = np.asarray(plydata.elements[0]["sh0_1"])
+            sh0[:, 0, 2] = np.asarray(plydata.elements[0]["sh0_2"])
 
-            extra_f_names = [
-                p.name
-                for p in plydata.elements[0].properties
-                if p.name.startswith("features_rest_")
-            ]
-            extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-            num_rest_features = len(extra_f_names)
-            features_rest = np.zeros((xyz.shape[0], num_rest_features))
-            for idx, attr_name in enumerate(extra_f_names):
-                features_rest[:, idx] = np.asarray(plydata.elements[0][attr_name])
-            features_rest = features_rest.reshape(
-                (features_rest.shape[0], 1, num_rest_features)
-            )
+            extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+            
+            if self.use_gmm_colors:
+                extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
+                features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+                for idx, attr_name in enumerate(extra_f_names):
+                    features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+                # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+                features_extra = features_extra.reshape((features_extra.shape[0], 1, (self.max_sh_degree) * self.params_size))
+            elif self.use_gmm_colors_cuda:
+                extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
+                features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
+                for idx, attr_name in enumerate(extra_f_names):
+                    features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+                # Reshape (P,F*SH_coeffs) to (P, 1, SH_coeffs except DC)
+                features_extra = features_extra.reshape((features_extra.shape[0], 1, (self.max_sh_degree) * self.params_size))
 
         scale_names = [
             p.name
@@ -640,14 +825,14 @@ class BetaModel:
             .contiguous()
             .requires_grad_(True)
         )
-        self._shN = nn.Parameter(
+        
+        if self.use_beta:
+            self._shN = nn.Parameter(
             torch.tensor(shs_extra, dtype=torch.float, device="cuda")
             .transpose(1, 2)
             .contiguous()
             .requires_grad_(True)
-        )
-        
-        if self.use_beta:
+            )
             self._sb_params = nn.Parameter(
                 torch.tensor(sb_params, dtype=torch.float, device="cuda")
                 .transpose(1, 2)
@@ -655,13 +840,49 @@ class BetaModel:
                 .requires_grad_(True)
             )
         else:
-            self._features_dc = nn.Parameter(
-                torch.tensor(features_dc, dtype=torch.float, device="cuda")
-                .contiguous()
-                .requires_grad_(True)
-            )
-            self._features_rest = nn.Parameter(
-                torch.tensor(features_rest, dtype=torch.float, device="cuda")
+            if self.use_gmm_colors_cuda:
+                # Interleaved format: [N, 1, max_sh_degree * params_size]
+                # Reshape and extract components
+                params_reshaped = features_extra.reshape(-1, self.max_sh_degree, self.params_size)
+                pos_np = params_reshaped[:, :, 0:self.position_size]
+                shape_np = params_reshaped[:, :, self.position_size:self.position_size + self.shape_size]
+                weight_np = params_reshaped[:, :, self.position_size + self.shape_size:]
+                
+                self._features_pos = nn.Parameter(
+                    torch.tensor(pos_np.reshape(-1, self.max_sh_degree * self.position_size), dtype=torch.float, device="cuda")
+                    .unsqueeze(-1)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+                self._features_shape = nn.Parameter(
+                    torch.tensor(shape_np.reshape(-1, self.max_sh_degree * self.shape_size), dtype=torch.float, device="cuda")
+                    .unsqueeze(-1)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+                self._features_weight = nn.Parameter(
+                    torch.tensor(weight_np.reshape(-1, self.max_sh_degree * self.color_size), dtype=torch.float, device="cuda")
+                    .unsqueeze(-1)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+            else:
+                # Linear format: [all_pos, all_shape, all_weight]
+                self._features_pos = nn.Parameter(
+                    torch.tensor(features_extra[:,:,0:self.position_size*self.max_sh_degree], dtype=torch.float, device="cuda")
+                    .transpose(1, 2)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+                self._features_shape = nn.Parameter(
+                    torch.tensor(features_extra[:,:,self.position_size*self.max_sh_degree:-self.color_size *self.max_sh_degree], dtype=torch.float, device="cuda")
+                    .transpose(1, 2)
+                    .contiguous()
+                    .requires_grad_(True)
+                )
+                self._features_weight = nn.Parameter(
+                    torch.tensor(features_extra[:,:,-self.color_size * self.max_sh_degree:], dtype=torch.float, device="cuda")
+                .transpose(1, 2)
                 .contiguous()
                 .requires_grad_(True)
             )
@@ -689,29 +910,39 @@ class BetaModel:
         xyz = decompress_png(path, "xyz", meta["xyz"])
         sh0 = decompress_png(path, "sh0", meta["sh0"])
 
-        shN = (
-            decompress_png(path, "shN", meta["shN"])
-            if self.max_sh_degree
-            else np.zeros((xyz.shape[0], (self.max_sh_degree + 1) ** 2 - 1, 3))
-        )
+        if self.use_beta:
+            shN = (
+                decompress_png(path, "shN", meta["shN"])
+                if self.max_sh_degree
+                else np.zeros((xyz.shape[0], (self.max_sh_degree + 1) ** 2 - 1, 3))
+            )
         opacity = decompress_png(path, "opacity", meta["opacity"])
         beta = decompress_png(path, "beta", meta["beta"])
         scaling = decompress_png(path, "scaling", meta["scaling"])
         rotation = decompress_png(path, "rotation", meta["rotation"])
-        if self.sb_number:
-            sb_params_list = []
-            for i in range(self.sb_number):
-                color = decompress_png(path, f"sb_{i}_color", meta[f"sb_{i}_color"])
-                direction = decompress_png(path, f"sb_{i}_lobe", meta[f"sb_{i}_lobe"])
-                # Concatenate along the feature dimension (expecting 3 channels each)
-                sb = np.concatenate(
-                    [color, direction], axis=1
-                )  # shape: (num_points, 6)
-                sb_params_list.append(sb)
-            # Stack to get shape (num_points, 6, sb_number)
-            sb_params = np.stack(sb_params_list, axis=2)
+        if self.use_beta:
+            if self.sb_number:
+                sb_params_list = []
+                for i in range(self.sb_number):
+                    color = decompress_png(path, f"sb_{i}_color", meta[f"sb_{i}_color"])
+                    direction = decompress_png(path, f"sb_{i}_lobe", meta[f"sb_{i}_lobe"])
+                    # Concatenate along the feature dimension (expecting 3 channels each)
+                    sb = np.concatenate(
+                        [color, direction], axis=1
+                    )  # shape: (num_points, 6)
+                    sb_params_list.append(sb)
+                # Stack to get shape (num_points, 6, sb_number)
+                sb_params = np.stack(sb_params_list, axis=2)
+            else:
+                sb_params = np.zeros((xyz.shape[0], 6, self.sb_number))
         else:
-            sb_params = np.zeros((xyz.shape[0], 6, self.sb_number))
+            nasg_params_list = []
+            for i in range(self.max_sh_degree):
+                pos = decompress_png(path, f"features_pos_{i}", meta[f"features_pos_{i}"])
+                shape = decompress_png(path, f"features_shape_{i}", meta[f"features_shape_{i}"])
+                weight = decompress_png(path, f"features_weight_{i}", meta[f"features_weight_{i}"])
+                nasg = np.concatenate([pos, shape, weight], axis=1)
+                nasg_params_list.append(nasg)
 
         self._xyz = nn.Parameter(
             torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
@@ -721,11 +952,36 @@ class BetaModel:
             .contiguous()
             .requires_grad_(True)
         )
-        self._shN = nn.Parameter(
-            torch.tensor(shN, dtype=torch.float, device="cuda")
-            .contiguous()
-            .requires_grad_(True)
-        )
+        if self.use_beta:
+            self._shN = nn.Parameter(
+                torch.tensor(shN, dtype=torch.float, device="cuda")
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._sb_params = nn.Parameter(
+                torch.tensor(sb_params, dtype=torch.float, device="cuda")
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
+        else:
+            self._features_pos = nn.Parameter(
+                torch.tensor(features_extra[:,:,0:self.position_size*self.max_sh_degree], dtype=torch.float, device="cuda")
+                .transpose(1, 2)
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._features_shape = nn.Parameter(
+                torch.tensor(features_extra[:,:,self.position_size*self.max_sh_degree:self.position_size*self.max_sh_degree+3], dtype=torch.float, device="cuda")
+                .contiguous()
+                .requires_grad_(True)
+            )
+            self._features_weight = nn.Parameter(
+                torch.tensor(features_extra[:,:,self.position_size*self.max_sh_degree+3:self.position_size*self.max_sh_degree+6], dtype=torch.float, device="cuda")
+                .contiguous()
+                .requires_grad_(True)
+            )
+
         self._opacity = nn.Parameter(
             torch.tensor(opacity, dtype=torch.float, device="cuda").requires_grad_(True)
         )
@@ -739,12 +995,6 @@ class BetaModel:
             torch.tensor(rotation, dtype=torch.float, device="cuda").requires_grad_(
                 True
             )
-        )
-        self._sb_params = nn.Parameter(
-            torch.tensor(sb_params, dtype=torch.float, device="cuda")
-            .transpose(1, 2)
-            .contiguous()
-            .requires_grad_(True)
         )
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -824,10 +1074,11 @@ class BetaModel:
         new_sh0,
         new_shN,
         new_sb_params,
+        new_features_pos,
+        new_features_shape,
+        new_features_weight,
         new_opacities,
         new_betas,
-        new_features_dc,
-        new_features_rest,
         new_scaling,
         new_rotation,
         reset_params=True,
@@ -847,9 +1098,9 @@ class BetaModel:
             d = {
                 "xyz": new_xyz,
                 "sh0": new_sh0,
-                "shN": new_shN,
-                "features_dc": new_features_dc,
-                "features_rest": new_features_rest,
+                "features_pos": new_features_pos,
+                "features_shape": new_features_shape,
+                "features_weight": new_features_weight,
                 "opacity": new_opacities,
                 "beta": new_betas,
                 "scaling": new_scaling,
@@ -859,12 +1110,13 @@ class BetaModel:
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._sh0 = optimizable_tensors["sh0"]
-        self._shN = optimizable_tensors["shN"]
         if self.use_beta:
+            self._shN = optimizable_tensors["shN"]
             self._sb_params = optimizable_tensors["sb_params"]
         else:
-            self._features_dc = optimizable_tensors["features_dc"]
-            self._features_rest = optimizable_tensors["features_rest"]
+            self._features_pos = optimizable_tensors["features_pos"]
+            self._features_shape = optimizable_tensors["features_shape"]
+            self._features_weight = optimizable_tensors["features_weight"]
         self._opacity = optimizable_tensors["opacity"]
         self._beta = optimizable_tensors["beta"]
         self._scaling = optimizable_tensors["scaling"]
@@ -887,9 +1139,9 @@ class BetaModel:
             tensors_dict = {
                 "xyz": self._xyz,
                 "sh0": self._sh0,
-                "shN": self._shN,
-                "features_dc": self._features_dc,
-                "features_rest": self._features_rest,
+                "features_pos": self._features_pos,
+                "features_shape": self._features_shape,
+                "features_weight": self._features_weight,
                 "opacity": self._opacity,
                 "beta": self._beta,
                 "scaling": self._scaling,
@@ -922,12 +1174,13 @@ class BetaModel:
 
         self._xyz = optimizable_tensors["xyz"]
         self._sh0 = optimizable_tensors["sh0"]
-        self._shN = optimizable_tensors["shN"]
         if self.use_beta:
+            self._shN = optimizable_tensors["shN"]
             self._sb_params = optimizable_tensors["sb_params"]
         else:
-            self._features_dc = optimizable_tensors["features_dc"]
-            self._features_rest = optimizable_tensors["features_rest"]
+            self._features_pos = optimizable_tensors["features_pos"]
+            self._features_shape = optimizable_tensors["features_shape"]
+            self._features_weight = optimizable_tensors["features_weight"]
         self._opacity = optimizable_tensors["opacity"]
         self._beta = optimizable_tensors["beta"]
         self._scaling = optimizable_tensors["scaling"]
@@ -962,9 +1215,9 @@ class BetaModel:
             return (
                 self._xyz[idxs],
                 self._sh0[idxs],
-                self._shN[idxs],
-                self._features_dc[idxs],
-                self._features_rest[idxs],
+                self._features_pos[idxs],
+                self._features_shape[idxs],
+                self._features_weight[idxs],
                 new_opacity,
                 self._beta[idxs],
                 self._scaling[idxs],
@@ -1012,9 +1265,9 @@ class BetaModel:
             (
                 self._xyz[dead_indices],
                 self._sh0[dead_indices],
-                self._shN[dead_indices],
-                self._features_dc[dead_indices],
-                self._features_rest[dead_indices],
+                self._features_pos[dead_indices],
+                self._features_shape[dead_indices],
+                self._features_weight[dead_indices],
                 self._opacity[dead_indices],
                 self._beta[dead_indices],
                 self._scaling[dead_indices],
@@ -1052,9 +1305,9 @@ class BetaModel:
             (
                 new_xyz,
                 new_sh0,
-                new_shN,
-                new_features_dc,
-                new_features_rest,
+                new_features_pos,
+                new_features_shape,
+                new_features_weight,
                 new_opacity,
                 new_beta,
                 new_scaling,
@@ -1069,6 +1322,9 @@ class BetaModel:
                 new_sh0,
                 new_shN,
                 new_sb_params,
+                None,
+                None,
+                None,
                 new_opacity,
                 new_beta,
                 new_scaling,
@@ -1079,9 +1335,11 @@ class BetaModel:
             self.densification_postfix(
                 new_xyz,
                 new_sh0,
-                new_shN,
-                new_features_dc,
-                new_features_rest,
+                None,
+                None,
+                new_features_pos,
+                new_features_shape,
+                new_features_weight,
                 new_opacity,
                 new_beta,
                 new_scaling,
@@ -1115,6 +1373,7 @@ class BetaModel:
                 scales=self.get_scaling[mask],
                 opacities=self.get_opacity.squeeze()[mask],
                 betas=self.get_beta.squeeze()[mask],
+                use_nasg=False,
                 colors=self.get_shs[mask],
                 viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
                 Ks=K.unsqueeze(0),
@@ -1128,16 +1387,18 @@ class BetaModel:
                 sb_params=self.get_sb_params[mask],
                 packed=False,
             )
-        else:
+        elif self.use_gmm_colors:
+                
             # calc colors with nasg function
-            dir_pp = self.get_xyz[mask] - viewpoint_camera.get_camera_center().unsqueeze(0)
+            dir_pp = self.get_xyz[mask] - viewpoint_camera.camera_center.unsqueeze(0)
             dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-8)
-
+            features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
+            
             if self.active_sh_degree > 0:
-                colors = nasg(dir_pp_normalized, self._features_rest[mask], self.active_sh_degree, self.max_sh_degree)
-                colors += self._features_dc[mask]
+                colors = nasg(dir_pp_normalized, features[mask, 3:], self.active_sh_degree, self.max_sh_degree)
+                colors += features[mask, :3]
             else:
-                colors = self._features_dc[mask].expand(-1, 3)
+                colors = features[mask, :3]
                 colors = torch.clamp_min(colors, 0.0)
 
             rgbs, alphas, meta = rasterization(
@@ -1157,6 +1418,39 @@ class BetaModel:
                 sh_degree=None,
                 sb_number=None,
                 sb_params=None,
+                packed=False,
+                )
+
+        elif self.use_gmm_colors_cuda:
+            # ## TODO: not ready
+            # ## Alternatively calc nasg in CUDA
+            features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
+
+            # Memory layout:
+            # sh0 lobe1 lobe2 .., lobeN
+            # sh0| pos1 shape1 weight1 | pos2 shape2 weight2 | ... | posN shapeN weightN
+            #  3 |  3     2       3    |   3     2      3    | ... |  3     2       3
+
+            # Assign zero to colors if no SH
+            colors = torch.zeros((features.shape[0], 3), device=features.device)
+            rgbs, alphas, meta = rasterization(
+                means=self.get_xyz[mask],
+                quats=self.get_rotation[mask],
+                scales=self.get_scaling[mask],
+                opacities=self.get_opacity.squeeze()[mask],
+                betas=self.get_beta.squeeze()[mask],
+                use_nasg=True,
+                colors=colors,
+                viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=viewpoint_camera.image_width,
+                height=viewpoint_camera.image_height,
+                backgrounds=self.background.unsqueeze(0),
+                render_mode=render_mode,
+                covars=None,
+                sh_degree=self.active_sh_degree,
+                sb_number=None,
+                sb_params=features,
                 packed=False,
             )
 
@@ -1224,36 +1518,91 @@ class BetaModel:
                 radius_clip=render_tab_state.radius_clip,
             )
         else:
-            # calc colors with nasg function
-            dir_pp = self.get_xyz[mask] - camera_state.get_camera_center().unsqueeze(0)
-            dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-8)
 
-            if self.active_sh_degree > 0:
-                colors = nasg(dir_pp_normalized, self._features_rest[mask], self.active_sh_degree, self.max_sh_degree)
-                colors += self._features_dc[mask]
+
+            # get camera center robustly (method / attribute / from c2w)
+            cam_center = None
+            if callable(getattr(camera_state, "get_camera_center", None)):
+                cam_center = camera_state.get_camera_center()
+            elif getattr(camera_state, "camera_center", None) is not None:
+                cam_center = camera_state.camera_center
+            elif getattr(camera_state, "c2w", None) is not None:
+                c2w_np = camera_state.c2w
+                # c2w may be numpy array or list-like
+                c2w_arr = np.asarray(c2w_np)
+                cam_center = c2w_arr[:3, 3]
             else:
-                colors = self._features_dc[mask].expand(-1, 3)
-                colors = torch.clamp_min(colors, 0.0)
+                raise AttributeError("CameraState has no camera center (no get_camera_center, camera_center or c2w).")
+            # convert to torch on the same device as model points
+            if isinstance(cam_center, torch.Tensor):
+                cam_center_t = cam_center.to(self._xyz.device).float().unsqueeze(0)
+            else:
+                cam_center_t = torch.from_numpy(np.asarray(cam_center)).float().to(self._xyz.device).unsqueeze(0)
+            # calc colors with nasg function
+            dir_pp = self.get_xyz[mask] - cam_center_t
+            dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-8)
+            features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
+            
+            if self.use_gmm_colors:
+                if self.active_sh_degree > 0:
+                    colors = nasg(dir_pp_normalized, features[mask, 3:], self.active_sh_degree, self.max_sh_degree)
+                    colors += features[mask, :3]
+                else:
+                    colors = features[mask, :3]
+                    colors = torch.clamp_min(colors, 0.0)
 
-            render_colors, alphas, meta = rasterization(
-                means=self.get_xyz[mask],
-                quats=self.get_rotation[mask],
-                scales=self.get_scaling[mask],
-                opacities=self.get_opacity.squeeze()[mask],
-                betas=self.get_beta.squeeze()[mask],
-                colors=colors,
-                viewmats=torch.linalg.inv(c2w).unsqueeze(0),
-                Ks=K.unsqueeze(0),
-                width=W,
-                height=H,
-                backgrounds=self.background.unsqueeze(0),
-                render_mode=render_mode,
-                covars=None,
-                sh_degree=None,
-                sb_number=None,
-                sb_params=None,
-                packed=False,
-            )
+                render_colors, alphas, meta = rasterization(
+                    means=self.get_xyz[mask],
+                    quats=self.get_rotation[mask],
+                    scales=self.get_scaling[mask],
+                    opacities=self.get_opacity.squeeze()[mask],
+                    betas=self.get_beta.squeeze()[mask],
+                    colors=colors,
+                    viewmats=torch.linalg.inv(c2w).unsqueeze(0),
+                    Ks=K.unsqueeze(0),
+                    width=W,
+                    height=H,
+                    backgrounds=self.background.unsqueeze(0),
+                    render_mode=render_mode,
+                    covars=None,
+                    sh_degree=None,
+                    sb_number=None,
+                    sb_params=None,
+                    packed=False,
+                )
+
+            elif self.use_gmm_colors_cuda:
+                # ## TODO: not ready
+                # ## Alternatively calc nasg in CUDA
+                features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
+
+                # Memory layout:
+                # sh0 lobe1 lobe2 .., lobeN
+                # sh0| pos1 shape1 weight1 | pos2 shape2 weight2 | ... | posN shapeN weightN
+                #  3 |  3     2       3    |   3     2      3    | ... |  3     2       3
+
+                # Assign to colors placeholder
+                colors = torch.zeros((features.shape[0], 3), device=features.device)
+                render_colors, alphas, meta = rasterization(
+                    means=self.get_xyz[mask],
+                    quats=self.get_rotation[mask],
+                    scales=self.get_scaling[mask],
+                    opacities=self.get_opacity.squeeze()[mask],
+                    betas=self.get_beta.squeeze()[mask],
+                    use_nasg=True,
+                    colors=colors,
+                    viewmats=torch.linalg.inv(c2w).unsqueeze(0),
+                    Ks=K.unsqueeze(0),
+                    width=W,
+                    height=H,
+                    backgrounds=self.background.unsqueeze(0),
+                    render_mode=render_mode,
+                    covars=None,
+                    sh_degree=self.active_sh_degree,
+                    sb_number=None,
+                    sb_params=features,
+                    packed=False,
+                )
 
         render_tab_state.total_count_number = len(self.get_xyz)
         render_tab_state.rendered_count_number = (meta["radii"] > 0).sum().item()
