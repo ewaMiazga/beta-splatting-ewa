@@ -2,6 +2,7 @@ import viser
 from nerfview import Viewer, RenderTabState
 from typing import Literal
 from typing import Callable, Tuple
+import numpy as np
 
 
 class BetaRenderTabState(RenderTabState):
@@ -123,6 +124,19 @@ class BetaViewer(Viewer):
                     self.render_tab_state.backgrounds = self.backgrounds_slider.value
                     self.rerender(_)
 
+                reset_up_button = self.server.gui.add_button(
+                    "Reset y axis Up Direction",
+                    icon=viser.Icon.ARROW_BIG_UP_LINES,
+                    color="gray",
+                    hint="Set the up direction of the camera orbit controls to the camera's current up direction.",
+                )
+
+                @reset_up_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    assert event.client is not None
+                    event.client.camera.up_direction = np.array([0.0, -1.0, 0.0])
+
+
         self._rendering_tab_handles.update(
             {
                 "b_range": self.gui_multi_slider,
@@ -132,6 +146,7 @@ class BetaViewer(Viewer):
                 "radius_clip_slider": self.radius_clip_slider,
                 "rener_mode_dropdown": self.render_mode_dropdown,
                 "backgrounds_slider": self.backgrounds_slider,
+                "reset_up_button": reset_up_button,
             }
         )
         super()._populate_rendering_tab()

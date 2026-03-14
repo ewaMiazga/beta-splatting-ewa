@@ -15,3 +15,8 @@ data
 experiment
 lego
 output*
+eval_cuda
+eval_mip360_indoor
+plots
+truck_beta_*
+truck_nasg_*

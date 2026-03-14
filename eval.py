@@ -7,11 +7,9 @@ from arguments import ModelParams
 
 
 def training(args):
-    beta_model = BetaModel(args.sh_degree, args.sb_number, args.use_beta, args.use_gmm_colors, args.use_gmm_colors_cuda)
+    beta_model = BetaModel(args.sh_degree, args.sb_number, args.use_beta, args.use_gmm_colors, args.gmm_color_mode, args.use_gmm_colors_cuda)
     bg_color = [1, 1, 1] if args.white_background else [0, 0, 0]
     beta_model.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    #beta_model.max_sh_degree = args.sh_degree if hasattr(args, 'sh_degree') else 2
-    #beta_model.active_sh_degree = beta_model.max_sh_degree
     scene = Scene(args, beta_model)
     print("scene loaded ")
     ply_path = os.path.join(
@@ -45,6 +43,7 @@ if __name__ == "__main__":
     
     # Set rendering mode boolean flags - all False by default
     rendering_mode = getattr(args, 'rendering_mode', None)
+    gmm_color_mode = getattr(args, 'gmm_color_mode', None)
     
     if rendering_mode is None:
         print("ERROR: --rendering_mode must be specified. Choose: 'beta', 'gmm', or 'gmm_cuda'")
@@ -53,6 +52,7 @@ if __name__ == "__main__":
     args.use_beta = (rendering_mode == "beta")
     args.use_gmm_colors = (rendering_mode == "gmm")
     args.use_gmm_colors_cuda = (rendering_mode == "gmm_cuda")
+    args.gmm_color_mode = gmm_color_mode
     
     args.eval = True
 

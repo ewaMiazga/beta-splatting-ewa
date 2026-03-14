@@ -29,7 +29,7 @@ import json
 import time
 from .beta_viewer import BetaRenderTabState
 
-from utils.spherical_utils import nasg
+from arguments import PARAMS_SIZE, COLOR_SIZE, POSITION_SIZE, SHAPE_SIZE, COLOR_FUNCTION
 
 
 def knn(x, K=4):
@@ -70,10 +70,12 @@ class BetaModel:
 
 
         if not self.use_beta:
-            self.position_size = 3
-            self.shape_size = 2
-            self.color_size = 3
-            self.params_size = 8  # total params per degree: position + shape + weight
+            self.color_func = COLOR_FUNCTION.get(self.gmm_color_mode)
+            
+            self.position_size = POSITION_SIZE[self.gmm_color_mode]  # 3
+            self.shape_size = SHAPE_SIZE[self.gmm_color_mode]
+            self.color_size = COLOR_SIZE[self.gmm_color_mode]
+            self.params_size = PARAMS_SIZE[self.gmm_color_mode]  # total params per degree: position + shape + weight
 
             def pos_activation(x):
                 return torch.tanh(x)
@@ -84,10 +86,13 @@ class BetaModel:
             self.pos_activation = lambda x: torch.tanh(x)
             self.weight_activation = lambda x: torch.tanh(x)
 
-    def __init__(self, sh_degree: int = 0, sb_number: int = 2, use_beta: bool = False, use_gmm_colors: bool = False, use_gmm_colors_cuda: bool = False):
+    def __init__(self, sh_degree: int = 0, sb_number: int = 2, use_beta: bool = False, use_gmm_colors: bool = False, gmm_color_mode: str = "nasg", use_gmm_colors_cuda: bool = False):
         self.use_beta = use_beta
         self.use_gmm_colors = use_gmm_colors
         self.use_gmm_colors_cuda = use_gmm_colors_cuda
+        if not use_beta:
+            assert gmm_color_mode in COLOR_FUNCTION, f"Invalid GMM color mode: {gmm_color_mode}. Supported modes: {list(COLOR_FUNCTION.keys())}"
+            self.gmm_color_mode = gmm_color_mode
         self.active_sh_degree = 0
         if self.use_beta:
             self.max_sh_degree = sh_degree
@@ -262,6 +267,7 @@ class BetaModel:
             print("sb_number:", self.sb_number)
         else:
             print("max_sh_degree:", self.max_sh_degree)
+            print("gmm_color_mode:", self.gmm_color_mode)
 
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -294,7 +300,7 @@ class BetaModel:
         
         elif self.use_gmm_colors:
             print("Initializing features for non-beta mode")
-            print("# Nasg lobes is: ", self.max_sh_degree)
+            print("# GMM lobes is: ", self.max_sh_degree)
             fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
             shs = (
                 torch.rand((fused_color.shape[0], 1, (self.max_sh_degree) * self.params_size + 3))
@@ -323,6 +329,13 @@ class BetaModel:
                     shs[:,:, idx] = math.log(0.5)  # Initialize all shape params to log(0.5)
 
             shs[:, 0, -3:] = fused_color #torch.log(fused_color + 1.0)
+
+            if self.gmm_color_mode == "nasg_gabor":
+                k_start = shape_end - self.max_sh_degree
+                k_end   = shape_end
+                
+                # initialize k to -1.6 for tanh *20
+                shs[:, 0, k_start:k_end] = -1.6  # Initialize k parameters to -1.6 -> after activation: 1.56
 
         elif self.use_gmm_colors_cuda:
             # fused_color: [N, 3]
@@ -620,10 +633,10 @@ class BetaModel:
                 shape = self._features_shape.squeeze(-1).reshape(-1, self.max_sh_degree, self.shape_size)
                 weight = self._features_weight.squeeze(-1).reshape(-1, self.max_sh_degree, self.color_size)
                 interleaved = torch.cat([pos, shape, weight], dim=2)  # [N, max_sh_degree, params_size]
-                nasg_params = interleaved.reshape(-1, self.max_sh_degree * self.params_size).detach().cpu().numpy()
+                gmm_params = interleaved.reshape(-1, self.max_sh_degree * self.params_size).detach().cpu().numpy()
             else:
                 # Linear layout: [all_pos, all_shape, all_weight]
-                nasg_params = torch.cat((self._features_pos, self._features_shape, self._features_weight), dim=1).detach().flatten(start_dim=1).contiguous().cpu().numpy()
+                gmm_params = torch.cat((self._features_pos, self._features_shape, self._features_weight), dim=1).detach().flatten(start_dim=1).contiguous().cpu().numpy()
 
         opacities = self._opacity.detach().cpu().numpy()
         betas = self._beta.detach().cpu().numpy()
@@ -642,7 +655,7 @@ class BetaModel:
             )
         else:
             attributes = np.concatenate(
-                (xyz, normals, sh0, nasg_params, opacities, betas, scale, rotation),
+                (xyz, normals, sh0, gmm_params, opacities, betas, scale, rotation),
                 axis=1,
             )
         elements[:] = list(map(tuple, attributes))
@@ -925,13 +938,13 @@ class BetaModel:
             else:
                 sb_params = np.zeros((xyz.shape[0], 6, self.sb_number))
         else:
-            nasg_params_list = []
+            gmm_params_list = []
             for i in range(self.max_sh_degree):
                 pos = decompress_png(path, f"features_pos_{i}", meta[f"features_pos_{i}"])
                 shape = decompress_png(path, f"features_shape_{i}", meta[f"features_shape_{i}"])
                 weight = decompress_png(path, f"features_weight_{i}", meta[f"features_weight_{i}"])
-                nasg = np.concatenate([pos, shape, weight], axis=1)
-                nasg_params_list.append(nasg)
+                gmm = np.concatenate([pos, shape, weight], axis=1)
+                gmm_params_list.append(gmm)
 
         self._xyz = nn.Parameter(
             torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
@@ -1362,7 +1375,7 @@ class BetaModel:
                 scales=self.get_scaling[mask],
                 opacities=self.get_opacity.squeeze()[mask],
                 betas=self.get_beta.squeeze()[mask],
-                use_nasg=False,
+                gmm_mode=None,
                 colors=self.get_shs[mask],
                 viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
                 Ks=K.unsqueeze(0),
@@ -1378,17 +1391,19 @@ class BetaModel:
             )
         elif self.use_gmm_colors:
                 
-            # calc colors with nasg function
+            # calc colors with gmm function
             dir_pp = self.get_xyz[mask] - viewpoint_camera.camera_center.unsqueeze(0)
             dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-8)
             features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
             
             if self.active_sh_degree > 0:
-                colors = nasg(dir_pp_normalized, features[mask, 3:], self.active_sh_degree, self.max_sh_degree)
+                colors = self.color_func(dir_pp_normalized, features[mask, 3:], self.active_sh_degree, self.max_sh_degree)
                 colors += features[mask, :3]
             else:
                 colors = features[mask, :3]
                 colors = torch.clamp_min(colors, 0.0)
+
+            print("colors shape", colors.shape)
 
             rgbs, alphas, meta = rasterization(
                 means=self.get_xyz[mask],
@@ -1396,6 +1411,7 @@ class BetaModel:
                 scales=self.get_scaling[mask],
                 opacities=self.get_opacity.squeeze()[mask],
                 betas=self.get_beta.squeeze()[mask],
+                gmm_mode=None,
                 colors=colors,
                 viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
                 Ks=K.unsqueeze(0),
@@ -1411,8 +1427,7 @@ class BetaModel:
                 )
 
         elif self.use_gmm_colors_cuda:
-            # ## TODO: not ready
-            # ## Alternatively calc nasg in CUDA
+            # ## Alternatively calc colors in CUDA
             features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
 
             # Memory layout:
@@ -1428,7 +1443,7 @@ class BetaModel:
                 scales=self.get_scaling[mask],
                 opacities=self.get_opacity.squeeze()[mask],
                 betas=self.get_beta.squeeze()[mask],
-                use_nasg=True,
+                gmm_mode=self.gmm_color_mode,
                 colors=colors,
                 viewmats=viewpoint_camera.world_view_transform.transpose(0, 1).unsqueeze(0),
                 Ks=K.unsqueeze(0),
@@ -1527,14 +1542,14 @@ class BetaModel:
                 cam_center_t = cam_center.to(self._xyz.device).float().unsqueeze(0)
             else:
                 cam_center_t = torch.from_numpy(np.asarray(cam_center)).float().to(self._xyz.device).unsqueeze(0)
-            # calc colors with nasg function
+            # calc colors with gmm color function
             dir_pp = self.get_xyz[mask] - cam_center_t
             dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-8)
             features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
             
             if self.use_gmm_colors:
                 if self.active_sh_degree > 0:
-                    colors = nasg(dir_pp_normalized, features[mask, 3:], self.active_sh_degree, self.max_sh_degree)
+                    colors = self.color_func(dir_pp_normalized, features[mask, 3:], self.active_sh_degree, self.max_sh_degree)
                     colors += features[mask, :3]
                 else:
                     colors = features[mask, :3]
@@ -1546,6 +1561,7 @@ class BetaModel:
                     scales=self.get_scaling[mask],
                     opacities=self.get_opacity.squeeze()[mask],
                     betas=self.get_beta.squeeze()[mask],
+                    gmm_mode=None,
                     colors=colors,
                     viewmats=torch.linalg.inv(c2w).unsqueeze(0),
                     Ks=K.unsqueeze(0),
@@ -1562,7 +1578,7 @@ class BetaModel:
 
             elif self.use_gmm_colors_cuda:
                 # ## TODO: not ready
-                # ## Alternatively calc nasg in CUDA
+                # ## Alternatively calc colors in CUDA
                 features = self.get_features.view(-1, (self.max_sh_degree) * self.params_size + 3)
 
                 # Memory layout:
@@ -1578,7 +1594,7 @@ class BetaModel:
                     scales=self.get_scaling[mask],
                     opacities=self.get_opacity.squeeze()[mask],
                     betas=self.get_beta.squeeze()[mask],
-                    use_nasg=True,
+                    gmm_mode=self.gmm_color_mode,
                     colors=colors,
                     viewmats=torch.linalg.inv(c2w).unsqueeze(0),
                     Ks=K.unsqueeze(0),

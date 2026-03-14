@@ -33,7 +33,7 @@ import importlib
 def training(args):
     first_iter = 0
     prepare_output_and_logger(args)
-    beta_model = BetaModel(args.sh_degree, args.sb_number, args.use_beta, args.use_gmm_colors, args.use_gmm_colors_cuda)
+    beta_model = BetaModel(args.sh_degree, args.sb_number, args.use_beta, args.use_gmm_colors, args.gmm_color_mode, args.use_gmm_colors_cuda)
     scene = Scene(args, beta_model)
     beta_model.training_setup(args)
     if args.start_checkpoint:
@@ -159,9 +159,9 @@ def training(args):
             beta_model.optimizer.step()
             beta_model.optimizer.zero_grad(set_to_none=True)
 
-            # scheduler on lr for any other param then xyz
-            if iteration > 7000:
-                beta_model.lr_scheduler.step()
+            # # scheduler on lr for any other param then xyz
+            # if iteration > 7000:
+            #     beta_model.lr_scheduler.step()
 
             if not args.disable_viewer:
                 num_train_rays_per_step = (
@@ -175,15 +175,18 @@ def training(args):
                 viewer.render_tab_state.num_train_rays_per_sec = num_train_rays_per_sec
                 viewer.update(iteration, num_train_rays_per_step)
 
-            # Patience-based best model saving in eval mode
-            if args.eval and iteration % 500 == 0 and iteration >= 15_000:
-                if scene.save_best_model():
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"\nEarly stopping.")
-                    break
+            # # Patience-based best model saving in eval mode
+            # if args.eval and iteration % 500 == 0 and iteration >= 15_000:
+            #     if scene.save_best_model():
+            #         patience_counter = 0
+            #     else:
+            #         patience_counter += 1
+            #     if patience_counter >= patience:
+            #         print(f"\nEarly stopping.")
+            #         break
+
+            if iteration == args.iterations:
+                break
 
         iteration += 1
 
@@ -194,20 +197,20 @@ def training(args):
     if args.eval:
         print("\nEvaluating Best Model Performance\n")
         beta_model.load_ply(
-            os.path.join(scene.model_path, "point_cloud/iteration_best/point_cloud.ply")
+            os.path.join(scene.model_path, f"point_cloud/iteration_{iteration}/point_cloud.ply")
         )
         result = scene.eval()
         with open(
-            os.path.join(scene.model_path, "point_cloud/iteration_best/metrics.json"),
+            os.path.join(scene.model_path, f"point_cloud/iteration_{iteration}/metrics.json"),
             "w",
         ) as f:
             json.dump(result, f, indent=True)
 
     if args.compress:
         if args.eval:
-            print("Compressing model at iteration_best...")
+            print(f"Compressing model at iteration_{iteration}...")
             beta_model.save_png(
-                os.path.join(scene.model_path, "point_cloud/iteration_best")
+                os.path.join(scene.model_path, f"point_cloud/iteration_{iteration}")
             )
         else:
             iteration = args.save_iterations[-1]
@@ -261,6 +264,7 @@ if __name__ == "__main__":
 
     # Set rendering mode boolean flags - all False by default
     rendering_mode = getattr(args, 'rendering_mode', None)
+    gmm_color_mode = getattr(args, 'gmm_color_mode', 'nasg')  # Default to 'nasg' if not set
     
     if rendering_mode is None:
         print("ERROR: --rendering_mode must be specified. Choose: 'beta', 'gmm', or 'gmm_cuda'")
@@ -269,9 +273,10 @@ if __name__ == "__main__":
     args.use_beta = (rendering_mode == "beta")
     args.use_gmm_colors = (rendering_mode == "gmm")
     args.use_gmm_colors_cuda = (rendering_mode == "gmm_cuda")
+    args.gmm_color_mode = gmm_color_mode  # Store the GMM color mode for later use in the model/viewer
     
     print(f"Rendering mode: {rendering_mode}")
-    print(f"Flags - use_beta: {args.use_beta}, use_gmm_colors: {args.use_gmm_colors}, use_gmm_colors_cuda: {args.use_gmm_colors_cuda}")
+    print(f"Flags - use_beta: {args.use_beta}, use_gmm_colors: {args.use_gmm_colors}, gmm_color_mode: {args.gmm_color_mode}, use_gmm_colors_cuda: {args.use_gmm_colors_cuda}")
 
     args.save_iterations.append(args.iterations)
 
